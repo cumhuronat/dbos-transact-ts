@@ -1,0 +1,1 @@
+{"version":3,"file":"migrations.d.ts","sourceRoot":"","sources":["../../../../src/sysdb_migrations/internal/migrations.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,WAAW,EAAE,MAAM,qBAAqB,CAAC;AAEvD,wBAAgB,aAAa,CAC3B,UAAU,GAAE,MAAe,EAC3B,IAAI,CAAC,EAAE;IAAE,eAAe,CAAC,EAAE,OAAO,CAAC;IAAC,WAAW,CAAC,EAAE,OAAO,CAAA;CAAE,GAC1D,aAAa,CAAC,WAAW,CAAC,CA2rB5B"}

@@ -1,6 +1,6 @@
 {
   "name": "@dbos-inc/dbos-sdk",
-  "version": "0.0.0-placeholder",
+  "version": "4.24.16-wake.1",
   "description": "A Typescript framework built on the database",
   "license": "MIT",
   "repository": {
@@ -70,8 +70,7 @@
     "test": "npm run build && npm run test:packages && npm run test:unit",
     "test:unit": "jest ./tests --coverage --collectCoverageFrom='src/**/*' --detectOpenHandles",
     "test:packages": "npm run --workspaces test",
-    "check:package": "npm run build && publint && attw --pack .",
-    "prepare": "husky"
+    "check:package": "npm run build && publint && attw --pack ."
   },
   "bin": {
     "dbos": "./dist/src/cli/cli.js",

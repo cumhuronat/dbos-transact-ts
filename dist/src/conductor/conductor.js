@@ -1,0 +1,888 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Conductor = void 0;
+const decorators_1 = require("../decorators");
+const utils_1 = require("../utils");
+const ws_1 = __importDefault(require("ws"));
+const protocol = __importStar(require("./protocol"));
+const node_os_1 = require("node:os");
+const workflow_management_1 = require("../workflow_management");
+const node_assert_1 = __importDefault(require("node:assert"));
+const zlib = __importStar(require("node:zlib"));
+const node_util_1 = require("node:util");
+const scheduler_1 = require("../scheduler/scheduler");
+const gzip = (0, node_util_1.promisify)(zlib.gzip);
+const gunzip = (0, node_util_1.promisify)(zlib.gunzip);
+class Conductor {
+    dbosExec;
+    appName;
+    conductorKey;
+    conductorURL;
+    executorMetadata;
+    url;
+    websocket = undefined;
+    isShuttingDown = false; // Is in the process of shutting down the connection
+    isClosed = false; // Has the connection been fully closed
+    pingPeriodMs = 20000; // Time in milliseconds to wait before sending a ping message to the conductor
+    pingTimeoutMs = 15000; // Time in milliseconds to wait for a response to a ping message before considering the connection dead
+    pingIntervalTimeout = undefined; // Combined interval and timeout for pinging Conductor
+    reconnectDelayMs = 1000;
+    reconnectTimeout = undefined;
+    constructor(dbosExec, appName, conductorKey, conductorURL, executorMetadata) {
+        this.dbosExec = dbosExec;
+        this.appName = appName;
+        this.conductorKey = conductorKey;
+        this.conductorURL = conductorURL;
+        this.executorMetadata = executorMetadata;
+        (0, node_assert_1.default)(appName, 'Application name must be set in configuration in order to use DBOS Conductor');
+        const cleanConductorURL = conductorURL.replace(/\/+$/, '');
+        this.url = `${cleanConductorURL}/websocket/${appName}/${conductorKey}`;
+    }
+    resetWebsocket(currWebsocket, currPing) {
+        clearInterval(currPing?.interval);
+        clearTimeout(currPing?.timeout);
+        if (currWebsocket) {
+            currWebsocket.terminate(); // Terminate the existing connection
+            if (this.websocket === currWebsocket) {
+                // Only clear if it's the same websocket
+                this.websocket = undefined;
+            }
+        }
+        if (this.reconnectTimeout || this.isShuttingDown) {
+            return;
+        }
+        this.dbosExec.logger.debug(`Reconnecting in ${this.reconnectDelayMs / 1000} second`);
+        this.reconnectTimeout = setTimeout(() => {
+            this.dispatchLoop();
+        }, this.reconnectDelayMs);
+    }
+    setPingInterval(currWebsocket, currPing) {
+        // Clear any existing ping interval to avoid multiple intervals being set
+        clearInterval(currPing.interval);
+        clearTimeout(currPing.timeout);
+        currPing.interval = setInterval(() => {
+            // Set ping timeout before sending ping. This prevents the socket from hanging at a non-open state indefinitely
+            currPing.timeout = setTimeout(() => {
+                if (this.isShuttingDown) {
+                    return;
+                }
+                else if (this.reconnectTimeout === undefined) {
+                    // Otherwise, try to reconnect if we haven't already
+                    this.dbosExec.logger.warn('Connection to conductor lost. Reconnecting...');
+                    this.resetWebsocket(currWebsocket, currPing);
+                }
+            }, this.pingTimeoutMs);
+            // Only ping if the connection is open
+            if (currWebsocket.readyState === ws_1.default.OPEN) {
+                this.dbosExec.logger.debug('Sending ping to conductor');
+                currWebsocket.ping();
+            }
+        }, this.pingPeriodMs);
+    }
+    dispatchLoop() {
+        if (this.websocket &&
+            (this.websocket.readyState === ws_1.default.OPEN || this.websocket.readyState === ws_1.default.CONNECTING)) {
+            this.dbosExec.logger.warn('Conductor websocket already exists');
+            return;
+        }
+        clearTimeout(this.pingIntervalTimeout?.timeout);
+        clearInterval(this.pingIntervalTimeout?.interval);
+        clearTimeout(this.reconnectTimeout);
+        this.reconnectTimeout = undefined;
+        if (this.isShuttingDown) {
+            this.dbosExec.logger.debug('Not starting dispatch loop as conductor is shutting down');
+            return;
+        }
+        try {
+            this.dbosExec.logger.debug(`Connecting to conductor at ${this.url}`);
+            // Start a new websocket connection
+            const currWebsocket = new ws_1.default(this.url, { handshakeTimeout: 5000 });
+            this.websocket = currWebsocket;
+            // Start ping interval
+            const currPing = { interval: undefined, timeout: undefined };
+            this.setPingInterval(currWebsocket, currPing);
+            this.pingIntervalTimeout = currPing;
+            currWebsocket.on('open', () => {
+                this.dbosExec.logger.debug('Opened connection to DBOS conductor');
+                clearTimeout(currPing.timeout);
+            });
+            currWebsocket.on('pong', () => {
+                this.dbosExec.logger.debug('Received pong from conductor');
+                clearTimeout(currPing.timeout);
+            });
+            currWebsocket.on('message', async (data) => {
+                this.dbosExec.logger.debug(`Received message from conductor: ${data}`);
+                const baseMsg = JSON.parse(data);
+                const msgType = baseMsg.type;
+                let errorMsg = undefined;
+                clearTimeout(currPing.timeout);
+                switch (msgType) {
+                    case protocol.MessageType.EXECUTOR_INFO:
+                        const infoResp = new protocol.ExecutorInfoResponse(baseMsg.request_id, utils_1.globalParams.executorID, utils_1.globalParams.appVersion, (0, node_os_1.hostname)(), 'typescript', utils_1.globalParams.dbosVersion, undefined, this.executorMetadata);
+                        currWebsocket.send(JSON.stringify(infoResp));
+                        this.dbosExec.logger.info('Connected to DBOS conductor');
+                        break;
+                    case protocol.MessageType.RECOVERY:
+                        const recoveryMsg = baseMsg;
+                        let success = true;
+                        try {
+                            await this.dbosExec.recoverPendingWorkflows(recoveryMsg.executor_ids);
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when recovering workflows: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                            success = false;
+                        }
+                        const recoveryResp = new protocol.RecoveryResponse(baseMsg.request_id, success, errorMsg);
+                        currWebsocket.send(JSON.stringify(recoveryResp));
+                        break;
+                    case protocol.MessageType.CANCEL:
+                        const cancelMsg = baseMsg;
+                        const cancelIds = cancelMsg.workflow_ids ?? [cancelMsg.workflow_id];
+                        let cancelSuccess = true;
+                        try {
+                            await this.dbosExec.systemDatabase.cancelWorkflows(cancelIds, cancelMsg.cancel_children);
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when cancelling workflow(s) ${String(cancelIds)}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                            cancelSuccess = false;
+                        }
+                        const cancelResp = new protocol.CancelResponse(baseMsg.request_id, cancelSuccess, errorMsg);
+                        currWebsocket.send(JSON.stringify(cancelResp));
+                        break;
+                    case protocol.MessageType.DELETE:
+                        const deleteMsg = baseMsg;
+                        const deleteIds = deleteMsg.workflow_ids ?? [deleteMsg.workflow_id];
+                        let deleteSuccess = true;
+                        try {
+                            await this.dbosExec.systemDatabase.deleteWorkflows(deleteIds, deleteMsg.delete_children ?? false);
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when deleting workflow(s) ${String(deleteIds)}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                            deleteSuccess = false;
+                        }
+                        const deleteResp = new protocol.DeleteResponse(baseMsg.request_id, deleteSuccess, errorMsg);
+                        currWebsocket.send(JSON.stringify(deleteResp));
+                        break;
+                    case protocol.MessageType.RESUME:
+                        const resumeMsg = baseMsg;
+                        const resumeIds = resumeMsg.workflow_ids ?? [resumeMsg.workflow_id];
+                        let resumeSuccess = true;
+                        try {
+                            await this.dbosExec.systemDatabase.resumeWorkflows(resumeIds, resumeMsg.queue_name);
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when resuming workflow(s) ${String(resumeIds)}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                            resumeSuccess = false;
+                        }
+                        const resumeResp = new protocol.ResumeResponse(baseMsg.request_id, resumeSuccess, errorMsg);
+                        currWebsocket.send(JSON.stringify(resumeResp));
+                        break;
+                    case protocol.MessageType.RESTART:
+                        const restartMsg = baseMsg;
+                        let restartSuccess = true;
+                        try {
+                            await this.dbosExec.forkWorkflow(restartMsg.workflow_id, 0);
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when restarting workflow ${restartMsg.workflow_id}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                            restartSuccess = false;
+                        }
+                        const restartResp = new protocol.RestartResponse(baseMsg.request_id, restartSuccess, errorMsg);
+                        currWebsocket.send(JSON.stringify(restartResp));
+                        break;
+                    case protocol.MessageType.FORK_WORKFLOW:
+                        const forkMsg = baseMsg;
+                        let newWorkflowID = forkMsg.body.new_workflow_id;
+                        try {
+                            newWorkflowID = await this.dbosExec.forkWorkflow(forkMsg.body.workflow_id, forkMsg.body.start_step, {
+                                newWorkflowID: newWorkflowID,
+                                applicationVersion: forkMsg.body.application_version,
+                                queueName: forkMsg.body.queue_name,
+                                queuePartitionKey: forkMsg.body.queue_partition_key,
+                            });
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when forking workflow ${forkMsg.body.workflow_id} to new workflow ${newWorkflowID} on step ${forkMsg.body.start_step}, app version ${forkMsg.body.application_version}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                            newWorkflowID = undefined;
+                        }
+                        const forkResp = new protocol.ForkWorkflowResponse(baseMsg.request_id, newWorkflowID, errorMsg);
+                        currWebsocket.send(JSON.stringify(forkResp));
+                        break;
+                    case protocol.MessageType.FORK_FROM_FAILURE:
+                        const forkFromFailureMsg = baseMsg;
+                        const forkFromFailureBody = forkFromFailureMsg.body;
+                        let forkedWorkflowIDs = undefined;
+                        try {
+                            forkedWorkflowIDs = await this.dbosExec.systemDatabase.forkFromFailure(forkFromFailureBody.workflow_ids, {
+                                applicationVersion: forkFromFailureBody.application_version,
+                                queueName: forkFromFailureBody.queue_name,
+                                queuePartitionKey: forkFromFailureBody.queue_partition_key,
+                                fromLastFailure: forkFromFailureBody.from_last_failure ?? false,
+                                fromLastStep: forkFromFailureBody.from_last_step ?? false,
+                                fromStep: forkFromFailureBody.from_step,
+                                fromStepName: forkFromFailureBody.from_step_name,
+                            });
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when bulk forking workflows: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const forkFromFailureResp = new protocol.ForkFromFailureResponse(baseMsg.request_id, forkedWorkflowIDs, errorMsg);
+                        currWebsocket.send(JSON.stringify(forkFromFailureResp));
+                        break;
+                    case protocol.MessageType.LIST_WORKFLOWS:
+                        const listWFMsg = baseMsg;
+                        const body = listWFMsg.body;
+                        const listWFReq = {
+                            workflowIDs: body.workflow_uuids,
+                            workflowName: body.workflow_name,
+                            authenticatedUser: body.authenticated_user,
+                            startTime: body.start_time,
+                            endTime: body.end_time,
+                            completedAfter: body.completed_after,
+                            completedBefore: body.completed_before,
+                            dequeuedAfter: body.dequeued_after,
+                            dequeuedBefore: body.dequeued_before,
+                            status: body.status,
+                            applicationVersion: body.application_version,
+                            forkedFrom: body.forked_from,
+                            parentWorkflowID: body.parent_workflow_id,
+                            queueName: body.queue_name,
+                            limit: body.limit,
+                            offset: body.offset,
+                            sortDesc: body.sort_desc,
+                            workflow_id_prefix: body.workflow_id_prefix,
+                            loadInput: body.load_input ?? false, // Default to false if not provided
+                            loadOutput: body.load_output ?? false, // Default to false if not provided
+                            executorId: body.executor_id,
+                            queuesOnly: body.queues_only,
+                            wasForkedFrom: body.was_forked_from,
+                            hasParent: body.has_parent,
+                            attributes: body.attributes,
+                            scheduleName: body.schedule_name,
+                        };
+                        let workflowsOutput = [];
+                        try {
+                            const workflows = await this.dbosExec.listWorkflows(listWFReq);
+                            workflowsOutput = workflows.map((wf) => new protocol.WorkflowsOutput(wf));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when listing workflows: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const wfsResp = new protocol.ListWorkflowsResponse(listWFMsg.request_id, workflowsOutput, errorMsg);
+                        currWebsocket.send(JSON.stringify(wfsResp));
+                        break;
+                    case protocol.MessageType.LIST_QUEUED_WORKFLOWS:
+                        const listQueuedWFMsg = baseMsg;
+                        const bodyQueued = listQueuedWFMsg.body;
+                        const listQueuedWFReq = {
+                            workflowIDs: bodyQueued.workflow_uuids,
+                            workflowName: bodyQueued.workflow_name,
+                            authenticatedUser: bodyQueued.authenticated_user,
+                            startTime: bodyQueued.start_time,
+                            endTime: bodyQueued.end_time,
+                            completedAfter: bodyQueued.completed_after,
+                            completedBefore: bodyQueued.completed_before,
+                            dequeuedAfter: bodyQueued.dequeued_after,
+                            dequeuedBefore: bodyQueued.dequeued_before,
+                            status: bodyQueued.status,
+                            applicationVersion: bodyQueued.application_version,
+                            forkedFrom: bodyQueued.forked_from,
+                            parentWorkflowID: bodyQueued.parent_workflow_id,
+                            queueName: bodyQueued.queue_name,
+                            limit: bodyQueued.limit,
+                            offset: bodyQueued.offset,
+                            sortDesc: bodyQueued.sort_desc,
+                            workflow_id_prefix: bodyQueued.workflow_id_prefix,
+                            loadInput: bodyQueued.load_input ?? false, // Default to false if not provided
+                            loadOutput: bodyQueued.load_output ?? false, // Default to false if not provided
+                            executorId: bodyQueued.executor_id,
+                            wasForkedFrom: bodyQueued.was_forked_from,
+                            hasParent: bodyQueued.has_parent,
+                            attributes: bodyQueued.attributes,
+                            scheduleName: bodyQueued.schedule_name,
+                        };
+                        let queuedWFOutput = [];
+                        try {
+                            const workflows = await this.dbosExec.listQueuedWorkflows(listQueuedWFReq);
+                            queuedWFOutput = workflows.map((wf) => new protocol.WorkflowsOutput(wf));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when listing queued workflows: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const queuedWfsResp = new protocol.ListQueuedWorkflowsResponse(listQueuedWFMsg.request_id, queuedWFOutput, errorMsg);
+                        currWebsocket.send(JSON.stringify(queuedWfsResp));
+                        break;
+                    case protocol.MessageType.GET_WORKFLOW:
+                        const getWFMsg = baseMsg;
+                        let wfOutput = undefined;
+                        try {
+                            const workflows = await this.dbosExec.listWorkflows({
+                                workflowIDs: [getWFMsg.workflow_id],
+                                loadInput: getWFMsg.load_input ?? true,
+                                loadOutput: getWFMsg.load_output ?? true,
+                            });
+                            if (workflows.length > 0) {
+                                wfOutput = new protocol.WorkflowsOutput(workflows[0]);
+                            }
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when getting workflow ${getWFMsg.workflow_id}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const getWFResp = new protocol.GetWorkflowResponse(getWFMsg.request_id, wfOutput, errorMsg);
+                        currWebsocket.send(JSON.stringify(getWFResp));
+                        break;
+                    case protocol.MessageType.EXIST_PENDING_WORKFLOWS:
+                        const existPendingMsg = baseMsg;
+                        let hasPendingWFs = false;
+                        try {
+                            const pendingWFs = await this.dbosExec.systemDatabase.getPendingWorkflows(existPendingMsg.executor_id, existPendingMsg.application_version);
+                            hasPendingWFs = pendingWFs.length > 0;
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when checking for pending workflows: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const existPendingResp = new protocol.ExistPendingWorkflowsResponse(baseMsg.request_id, hasPendingWFs, errorMsg);
+                        currWebsocket.send(JSON.stringify(existPendingResp));
+                        break;
+                    case protocol.MessageType.LIST_STEPS:
+                        const listStepsMessage = baseMsg;
+                        let workflowSteps = undefined;
+                        try {
+                            const stepsInfo = await this.dbosExec.listWorkflowSteps(listStepsMessage.workflow_id, listStepsMessage.load_output ?? true, { limit: listStepsMessage.limit, offset: listStepsMessage.offset });
+                            workflowSteps = stepsInfo?.map((i) => new protocol.WorkflowSteps(i));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when listing steps ${listStepsMessage.workflow_id}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const listStepsResponse = new protocol.ListStepsResponse(listStepsMessage.request_id, workflowSteps, errorMsg);
+                        currWebsocket.send(JSON.stringify(listStepsResponse));
+                        break;
+                    case protocol.MessageType.RETENTION:
+                        const retentionMessage = baseMsg;
+                        let retentionSuccess = true;
+                        try {
+                            await this.dbosExec.systemDatabase.garbageCollect(retentionMessage.body.gc_cutoff_epoch_ms, retentionMessage.body.gc_rows_threshold);
+                            if (retentionMessage.body.timeout_cutoff_epoch_ms) {
+                                await (0, workflow_management_1.globalTimeout)(this.dbosExec.systemDatabase, retentionMessage.body.timeout_cutoff_epoch_ms);
+                            }
+                        }
+                        catch (e) {
+                            retentionSuccess = false;
+                            errorMsg = `Exception encountered during enforcing retention policy: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const retentionResponse = new protocol.RetentionResponse(retentionMessage.request_id, retentionSuccess, errorMsg);
+                        currWebsocket.send(JSON.stringify(retentionResponse));
+                        break;
+                    case protocol.MessageType.GET_METRICS:
+                        const getMetricsMessage = baseMsg;
+                        this.dbosExec.logger.debug(`Received metrics request for time range ${getMetricsMessage.start_time} to ${getMetricsMessage.end_time}`);
+                        let metricsData = [];
+                        if (getMetricsMessage.metric_class === 'workflow_step_count') {
+                            try {
+                                const sysMetrics = await this.dbosExec.systemDatabase.getMetrics(getMetricsMessage.start_time, getMetricsMessage.end_time);
+                                metricsData = sysMetrics.map((m) => new protocol.MetricDataOutput(m.metricType, m.metricName, m.value));
+                            }
+                            catch (e) {
+                                errorMsg = `Exception encountered when getting metrics: ${e.message}`;
+                                this.dbosExec.logger.error(errorMsg);
+                            }
+                        }
+                        else {
+                            errorMsg = `Unexpected metric class: ${getMetricsMessage.metric_class}`;
+                            this.dbosExec.logger.warn(errorMsg);
+                        }
+                        const getMetricsResponse = new protocol.GetMetricsResponse(getMetricsMessage.request_id, metricsData, errorMsg);
+                        currWebsocket.send(JSON.stringify(getMetricsResponse));
+                        break;
+                    case protocol.MessageType.EXPORT_WORKFLOW:
+                        const exportMsg = baseMsg;
+                        let serializedWorkflow = null;
+                        try {
+                            const exported = await this.dbosExec.systemDatabase.exportWorkflow(exportMsg.workflow_id, exportMsg.export_children ?? false);
+                            if (exported.length > 0) {
+                                const jsonStr = JSON.stringify(exported);
+                                const compressed = await gzip(jsonStr);
+                                serializedWorkflow = compressed.toString('base64');
+                            }
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when exporting workflow ${exportMsg.workflow_id}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const exportResp = new protocol.ExportWorkflowResponse(baseMsg.request_id, serializedWorkflow, errorMsg);
+                        currWebsocket.send(JSON.stringify(exportResp));
+                        break;
+                    case protocol.MessageType.IMPORT_WORKFLOW:
+                        const importMsg = baseMsg;
+                        let importSuccess = true;
+                        try {
+                            const compressedData = Buffer.from(importMsg.serialized_workflow, 'base64');
+                            const decompressed = await gunzip(compressedData);
+                            const workflows = JSON.parse(decompressed.toString());
+                            await this.dbosExec.systemDatabase.importWorkflow(workflows);
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when importing workflow: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                            importSuccess = false;
+                        }
+                        const importResp = new protocol.ImportWorkflowResponse(baseMsg.request_id, importSuccess, errorMsg);
+                        currWebsocket.send(JSON.stringify(importResp));
+                        break;
+                    case protocol.MessageType.ALERT:
+                        const alertMsg = baseMsg;
+                        let alertSuccess = true;
+                        try {
+                            const handler = (0, decorators_1.getAlertHandler)();
+                            if (handler) {
+                                await Promise.resolve(handler(alertMsg.name, alertMsg.message, alertMsg.metadata));
+                            }
+                            else {
+                                this.dbosExec.logger.warn(`Alert received (no handler registered): [${alertMsg.name}] ${alertMsg.message} | Metadata: ${JSON.stringify(alertMsg.metadata)}`);
+                            }
+                        }
+                        catch (e) {
+                            errorMsg = `Exception in alert handler: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                            alertSuccess = false;
+                        }
+                        const alertResp = new protocol.AlertResponse(baseMsg.request_id, alertSuccess, errorMsg);
+                        currWebsocket.send(JSON.stringify(alertResp));
+                        break;
+                    case protocol.MessageType.LIST_SCHEDULES:
+                        const listSchedMsg = baseMsg;
+                        const loadContextList = listSchedMsg.body.load_context ?? true;
+                        let schedOutput = [];
+                        try {
+                            const scheds = await this.dbosExec.systemDatabase.listSchedules({
+                                status: listSchedMsg.body.status,
+                                workflowName: listSchedMsg.body.workflow_name,
+                                scheduleNamePrefix: listSchedMsg.body.schedule_name_prefix,
+                            });
+                            schedOutput = await Promise.all(scheds.map(async (s) => ({
+                                schedule_id: s.scheduleId,
+                                schedule_name: s.scheduleName,
+                                workflow_name: s.workflowName,
+                                workflow_class_name: s.workflowClassName || undefined,
+                                schedule: s.schedule,
+                                status: s.status,
+                                context: loadContextList ? (0, node_util_1.inspect)(await this.dbosExec.serializer.parse(s.context)) : undefined,
+                                last_fired_at: s.lastFiredAt,
+                                automatic_backfill: s.automaticBackfill,
+                                cron_timezone: s.cronTimezone,
+                                queue_name: s.queueName,
+                            })));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when listing schedules: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const listSchedResp = new protocol.ListSchedulesResponse(listSchedMsg.request_id, schedOutput, errorMsg);
+                        currWebsocket.send(JSON.stringify(listSchedResp));
+                        break;
+                    case protocol.MessageType.GET_SCHEDULE:
+                        const getSchedMsg = baseMsg;
+                        const loadContextGet = getSchedMsg.load_context ?? true;
+                        let getSchedOutput = undefined;
+                        try {
+                            const sched = await this.dbosExec.systemDatabase.getSchedule(getSchedMsg.schedule_name);
+                            if (sched) {
+                                getSchedOutput = {
+                                    schedule_id: sched.scheduleId,
+                                    schedule_name: sched.scheduleName,
+                                    workflow_name: sched.workflowName,
+                                    workflow_class_name: sched.workflowClassName || undefined,
+                                    schedule: sched.schedule,
+                                    status: sched.status,
+                                    context: loadContextGet ? (0, node_util_1.inspect)(await this.dbosExec.serializer.parse(sched.context)) : undefined,
+                                    last_fired_at: sched.lastFiredAt,
+                                    automatic_backfill: sched.automaticBackfill,
+                                    cron_timezone: sched.cronTimezone,
+                                    queue_name: sched.queueName,
+                                };
+                            }
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when getting schedule ${getSchedMsg.schedule_name}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const getSchedResp = new protocol.GetScheduleResponse(getSchedMsg.request_id, getSchedOutput, errorMsg);
+                        currWebsocket.send(JSON.stringify(getSchedResp));
+                        break;
+                    case protocol.MessageType.PAUSE_SCHEDULE:
+                        const pauseSchedMsg = baseMsg;
+                        let pauseSuccess = true;
+                        try {
+                            await this.dbosExec.systemDatabase.setScheduleStatus(pauseSchedMsg.schedule_name, 'PAUSED');
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when pausing schedule '${pauseSchedMsg.schedule_name}': ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                            pauseSuccess = false;
+                        }
+                        const pauseSchedResp = new protocol.PauseScheduleResponse(baseMsg.request_id, pauseSuccess, errorMsg);
+                        currWebsocket.send(JSON.stringify(pauseSchedResp));
+                        break;
+                    case protocol.MessageType.RESUME_SCHEDULE:
+                        const resumeSchedMsg = baseMsg;
+                        let resumeSchedSuccess = true;
+                        try {
+                            await this.dbosExec.systemDatabase.setScheduleStatus(resumeSchedMsg.schedule_name, 'ACTIVE');
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when resuming schedule '${resumeSchedMsg.schedule_name}': ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                            resumeSchedSuccess = false;
+                        }
+                        const resumeSchedResp = new protocol.ResumeScheduleResponse(baseMsg.request_id, resumeSchedSuccess, errorMsg);
+                        currWebsocket.send(JSON.stringify(resumeSchedResp));
+                        break;
+                    case protocol.MessageType.BACKFILL_SCHEDULE:
+                        const backfillSchedMsg = baseMsg;
+                        let backfillWorkflowIds = [];
+                        try {
+                            backfillWorkflowIds = await (0, scheduler_1.backfillSchedule)(this.dbosExec.systemDatabase, this.dbosExec.serializer, backfillSchedMsg.schedule_name, new Date(backfillSchedMsg.start), new Date(backfillSchedMsg.end));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when backfilling schedule '${backfillSchedMsg.schedule_name}': ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const backfillSchedResp = new protocol.BackfillScheduleResponse(baseMsg.request_id, backfillWorkflowIds, errorMsg);
+                        currWebsocket.send(JSON.stringify(backfillSchedResp));
+                        break;
+                    case protocol.MessageType.TRIGGER_SCHEDULE:
+                        const triggerSchedMsg = baseMsg;
+                        let triggerWorkflowId = undefined;
+                        try {
+                            triggerWorkflowId = await (0, scheduler_1.triggerSchedule)(this.dbosExec.systemDatabase, this.dbosExec.serializer, triggerSchedMsg.schedule_name);
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when triggering schedule '${triggerSchedMsg.schedule_name}': ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const triggerSchedResp = new protocol.TriggerScheduleResponse(baseMsg.request_id, triggerWorkflowId, errorMsg);
+                        currWebsocket.send(JSON.stringify(triggerSchedResp));
+                        break;
+                    case protocol.MessageType.LIST_APPLICATION_VERSIONS:
+                        let versionsOutput = [];
+                        try {
+                            const versions = await this.dbosExec.systemDatabase.listApplicationVersions();
+                            versionsOutput = versions.map((v) => ({
+                                version_id: v.versionId,
+                                version_name: v.versionName,
+                                version_timestamp: v.versionTimestamp,
+                                created_at: v.createdAt,
+                            }));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when listing application versions: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const listVersionsResp = new protocol.ListApplicationVersionsResponse(baseMsg.request_id, versionsOutput, errorMsg);
+                        currWebsocket.send(JSON.stringify(listVersionsResp));
+                        break;
+                    case protocol.MessageType.SET_LATEST_APPLICATION_VERSION:
+                        const setVersionMsg = baseMsg;
+                        let setVersionSuccess = true;
+                        try {
+                            await this.dbosExec.systemDatabase.updateApplicationVersionTimestamp(setVersionMsg.version_name, Date.now());
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when setting latest application version '${setVersionMsg.version_name}': ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                            setVersionSuccess = false;
+                        }
+                        const setVersionResp = new protocol.SetLatestApplicationVersionResponse(baseMsg.request_id, setVersionSuccess, errorMsg);
+                        currWebsocket.send(JSON.stringify(setVersionResp));
+                        break;
+                    case protocol.MessageType.GET_WORKFLOW_EVENTS:
+                        const eventsMsg = baseMsg;
+                        let eventOutputs = undefined;
+                        try {
+                            const rawEvents = await this.dbosExec.systemDatabase.getAllEvents(eventsMsg.workflow_id);
+                            eventOutputs = Object.entries(rawEvents).map(([key, value]) => ({
+                                key,
+                                value: (0, node_util_1.inspect)(value),
+                            }));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when getting events for workflow ${eventsMsg.workflow_id}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const eventsResp = new protocol.GetWorkflowEventsResponse(baseMsg.request_id, eventOutputs, errorMsg);
+                        currWebsocket.send(JSON.stringify(eventsResp));
+                        break;
+                    case protocol.MessageType.GET_WORKFLOW_NOTIFICATIONS:
+                        const notifsMsg = baseMsg;
+                        let notifOutputs = undefined;
+                        try {
+                            const rawNotifs = await this.dbosExec.systemDatabase.getAllNotifications(notifsMsg.workflow_id);
+                            notifOutputs = rawNotifs.map((n) => ({
+                                topic: n.topic,
+                                message: (0, node_util_1.inspect)(n.message),
+                                created_at_epoch_ms: n.createdAtEpochMs,
+                                consumed: n.consumed,
+                            }));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when getting notifications for workflow ${notifsMsg.workflow_id}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const notifsResp = new protocol.GetWorkflowNotificationsResponse(baseMsg.request_id, notifOutputs, errorMsg);
+                        currWebsocket.send(JSON.stringify(notifsResp));
+                        break;
+                    case protocol.MessageType.GET_WORKFLOW_STREAMS:
+                        const streamsMsg = baseMsg;
+                        let streamOutputs = undefined;
+                        try {
+                            const rawStreams = await this.dbosExec.systemDatabase.getAllStreamEntries(streamsMsg.workflow_id);
+                            streamOutputs = Object.entries(rawStreams).map(([key, values]) => ({
+                                key,
+                                values: values.map((v) => (0, node_util_1.inspect)(v)),
+                            }));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when getting streams for workflow ${streamsMsg.workflow_id}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const streamsResp = new protocol.GetWorkflowStreamsResponse(baseMsg.request_id, streamOutputs, errorMsg);
+                        currWebsocket.send(JSON.stringify(streamsResp));
+                        break;
+                    case protocol.MessageType.GET_WORKFLOW_AGGREGATES:
+                        const aggMsg = baseMsg;
+                        const aggBody = aggMsg.body;
+                        let aggOutput = [];
+                        // Backwards compat: older clients send no select_* flags and expect counts.
+                        let selectCount = aggBody.select_count ?? false;
+                        const selectMinCreatedAt = aggBody.select_min_created_at ?? false;
+                        const selectMaxQueueWaitMs = aggBody.select_max_queue_wait_ms ?? false;
+                        const selectMaxTotalLatencyMs = aggBody.select_max_total_latency_ms ?? false;
+                        if (!(selectCount || selectMinCreatedAt || selectMaxQueueWaitMs || selectMaxTotalLatencyMs)) {
+                            selectCount = true;
+                        }
+                        try {
+                            const rows = await this.dbosExec.systemDatabase.getWorkflowAggregates({
+                                groupByStatus: aggBody.group_by_status ?? false,
+                                groupByName: aggBody.group_by_name ?? false,
+                                groupByQueueName: aggBody.group_by_queue_name ?? false,
+                                groupByExecutorId: aggBody.group_by_executor_id ?? false,
+                                groupByApplicationVersion: aggBody.group_by_application_version ?? false,
+                                selectCount,
+                                selectMinCreatedAt,
+                                selectMaxQueueWaitMs,
+                                selectMaxTotalLatencyMs,
+                                timeBucketSizeMs: aggBody.time_bucket_size_ms ?? undefined,
+                                status: aggBody.status,
+                                startTime: aggBody.start_time,
+                                endTime: aggBody.end_time,
+                                completedAfter: aggBody.completed_after,
+                                completedBefore: aggBody.completed_before,
+                                dequeuedAfter: aggBody.dequeued_after,
+                                dequeuedBefore: aggBody.dequeued_before,
+                                name: aggBody.name,
+                                appVersion: aggBody.app_version,
+                                executorId: aggBody.executor_id,
+                                queueName: aggBody.queue_name,
+                                workflowIdPrefix: aggBody.workflow_id_prefix,
+                                workflowIDs: aggBody.workflow_uuids,
+                                authenticatedUser: aggBody.authenticated_user,
+                                forkedFrom: aggBody.forked_from,
+                                parentWorkflowID: aggBody.parent_workflow_id,
+                                scheduleName: aggBody.schedule_name,
+                                queuesOnly: aggBody.queues_only,
+                                wasForkedFrom: aggBody.was_forked_from,
+                                hasParent: aggBody.has_parent,
+                                attributes: aggBody.attributes,
+                            });
+                            aggOutput = rows.map((r) => ({
+                                group: r.group,
+                                count: r.count,
+                                min_created_at: r.minCreatedAt,
+                                max_queue_wait_ms: r.maxQueueWaitMs,
+                                max_total_latency_ms: r.maxTotalLatencyMs,
+                            }));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when getting workflow aggregates: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const aggResp = new protocol.GetWorkflowAggregatesResponse(baseMsg.request_id, aggOutput, errorMsg);
+                        currWebsocket.send(JSON.stringify(aggResp));
+                        break;
+                    case protocol.MessageType.GET_STEP_AGGREGATES:
+                        const stepAggMsg = baseMsg;
+                        const stepAggBody = stepAggMsg.body;
+                        let stepAggOutput = [];
+                        // Backwards compat: older clients send no select_* flags and expect counts.
+                        let stepSelectCount = stepAggBody.select_count ?? false;
+                        const stepSelectMaxDurationMs = stepAggBody.select_max_duration_ms ?? false;
+                        if (!(stepSelectCount || stepSelectMaxDurationMs)) {
+                            stepSelectCount = true;
+                        }
+                        try {
+                            const rows = await this.dbosExec.systemDatabase.getStepAggregates({
+                                groupByFunctionName: stepAggBody.group_by_function_name ?? false,
+                                groupByStatus: stepAggBody.group_by_status ?? false,
+                                selectCount: stepSelectCount,
+                                selectMaxDurationMs: stepSelectMaxDurationMs,
+                                timeBucketSizeMs: stepAggBody.time_bucket_size_ms ?? undefined,
+                                status: stepAggBody.status,
+                                functionName: stepAggBody.function_name,
+                                workflowIdPrefix: stepAggBody.workflow_id_prefix,
+                                completedAfter: stepAggBody.completed_after,
+                                completedBefore: stepAggBody.completed_before,
+                            });
+                            stepAggOutput = rows.map((r) => ({
+                                group: r.group,
+                                count: r.count,
+                                max_duration_ms: r.maxDurationMs,
+                            }));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when getting step aggregates: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const stepAggResp = new protocol.GetStepAggregatesResponse(baseMsg.request_id, stepAggOutput, errorMsg);
+                        currWebsocket.send(JSON.stringify(stepAggResp));
+                        break;
+                    case protocol.MessageType.LIST_QUEUES:
+                        let queueOutputs = [];
+                        try {
+                            const queues = await this.dbosExec.systemDatabase.listQueues();
+                            queueOutputs = queues.map((q) => ({
+                                name: q.name,
+                                concurrency: q.concurrency,
+                                worker_concurrency: q.workerConcurrency,
+                                rate_limit_max: q.rateLimitMax,
+                                rate_limit_period_sec: q.rateLimitPeriodSec,
+                                priority_enabled: q.priorityEnabled,
+                                partition_queue: q.partitionQueue,
+                                polling_interval_sec: q.pollingIntervalSec,
+                            }));
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when listing queues: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const listQueuesResp = new protocol.ListQueuesResponse(baseMsg.request_id, queueOutputs, errorMsg);
+                        currWebsocket.send(JSON.stringify(listQueuesResp));
+                        break;
+                    case protocol.MessageType.GET_QUEUE:
+                        const getQueueMsg = baseMsg;
+                        let getQueueOutput = null;
+                        try {
+                            const queue = await this.dbosExec.systemDatabase.getQueue(getQueueMsg.name);
+                            if (queue !== null) {
+                                getQueueOutput = {
+                                    name: queue.name,
+                                    concurrency: queue.concurrency,
+                                    worker_concurrency: queue.workerConcurrency,
+                                    rate_limit_max: queue.rateLimitMax,
+                                    rate_limit_period_sec: queue.rateLimitPeriodSec,
+                                    priority_enabled: queue.priorityEnabled,
+                                    partition_queue: queue.partitionQueue,
+                                    polling_interval_sec: queue.pollingIntervalSec,
+                                };
+                            }
+                        }
+                        catch (e) {
+                            errorMsg = `Exception encountered when getting queue ${getQueueMsg.name}: ${e.message}`;
+                            this.dbosExec.logger.error(errorMsg);
+                        }
+                        const getQueueResp = new protocol.GetQueueResponse(baseMsg.request_id, getQueueOutput, errorMsg);
+                        currWebsocket.send(JSON.stringify(getQueueResp));
+                        break;
+                    default:
+                        this.dbosExec.logger.warn(`Unknown message type: ${baseMsg.type}`);
+                        // Still need to send a response to the conductor
+                        const unknownResp = new protocol.BaseResponse(baseMsg.type, baseMsg.request_id, 'Unknown message type');
+                        currWebsocket.send(JSON.stringify(unknownResp));
+                }
+            });
+            currWebsocket.on('close', () => {
+                if (this.isShuttingDown) {
+                    this.dbosExec.logger.info('Shutdown Conductor connection');
+                    return;
+                }
+                else if (this.reconnectTimeout === undefined) {
+                    this.dbosExec.logger.warn('Connection to conductor lost. Reconnecting.');
+                    this.resetWebsocket(currWebsocket, currPing);
+                }
+            });
+            currWebsocket.on('unexpected-response', (_, res) => {
+                const chunks = [];
+                res.on('data', (chunk) => chunks.push(chunk));
+                res.on('end', () => {
+                    const body = Buffer.concat(chunks).toString('utf-8');
+                    this.dbosExec.logger.warn(`Unexpected response from conductor: ${res.statusCode} ${res.statusMessage}. Details: ${body}`);
+                    if (this.reconnectTimeout === undefined) {
+                        this.resetWebsocket(currWebsocket, currPing);
+                    }
+                });
+            });
+            currWebsocket.on('error', (err) => {
+                this.dbosExec.logger.warn(`Unexpected exception in connection to conductor. Reconnecting: ${err.message}`);
+                if (this.reconnectTimeout === undefined) {
+                    this.resetWebsocket(currWebsocket, currPing);
+                }
+            });
+        }
+        catch (e) {
+            this.dbosExec.logger.warn(`Error in conductor loop. Reconnecting: ${e.message}`);
+            if (this.reconnectTimeout === undefined) {
+                this.resetWebsocket(this.websocket, this.pingIntervalTimeout);
+            }
+        }
+    }
+    stop() {
+        this.isShuttingDown = true;
+        clearInterval(this.pingIntervalTimeout?.interval);
+        clearTimeout(this.pingIntervalTimeout?.timeout);
+        clearTimeout(this.reconnectTimeout);
+        if (this.websocket) {
+            this.websocket.close();
+        }
+        this.isClosed = true;
+    }
+}
+exports.Conductor = Conductor;
+//# sourceMappingURL=conductor.js.map
