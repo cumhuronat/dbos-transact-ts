@@ -546,6 +546,24 @@ class WFQueueRunner {
       });
     };
 
+    // Wake the scheduler when a workflow becomes ENQUEUED. The SystemDatabase emits an app-side,
+    // coalesced NOTIFY at ENQUEUED-transitions only (never per status update — the workflow_status
+    // table is far too hot for a trigger; see its wake-channel note), and delivers the woken queue
+    // name here. We mark that queue due and trip waitForWakeOrTimeout, so an enqueue dispatches in
+    // ~one coalesce window instead of waiting up to one poll interval. Strictly a hint: the poll
+    // cadence below is unchanged and stays the correctness floor, so a missed NOTIFY costs at most
+    // one interval. `registerQueueWake` returns undefined (a no-op) when wakes are disabled or
+    // LISTEN/NOTIFY is unavailable, leaving the pure-poll behavior byte-for-byte intact.
+    const queueWakeHandle = exec.systemDatabase.registerQueueWake((queueName?: string) => {
+      if (queueName !== undefined) {
+        const state = this.states.get(queueName);
+        // Untracked queue (e.g. a brand-new DB-backed queue not yet reconciled): the poll floor and
+        // the next reconcile still pick it up, so a bare wake is safe and sufficient.
+        if (state) state.nextPollAt = 0;
+      }
+      wake();
+    });
+
     // Discovery already ran during setup; defer the next reconcile a full interval.
     let lastReconcileAt = startNow;
     // Global op: run on a fixed cadence, not once per wake (destaggered wakeups would push it to ~N/sec).
@@ -588,6 +606,10 @@ class WFQueueRunner {
       const sleepMs = Math.max(0, nextWakeAt - Date.now());
       await waitForWakeOrTimeout(sleepMs);
     }
+
+    // Stop receiving enqueue wakes before we drain: the loop is exiting, so any further wake would
+    // only set wakePending on a dead scheduler. Safe even if the handle is undefined (wakes off).
+    exec.systemDatabase.deregisterQueueWake(queueWakeHandle);
 
     await Promise.allSettled(Array.from(inFlightPolls.values()));
   }

@@ -1609,6 +1609,12 @@ describe('queue-time-outs', () => {
 
   beforeAll(async () => {
     config = generateDBOSTestConfig();
+    // These tests stage timeout-cascade windows using the classic dequeue poll cadence as a timing
+    // device (e.g. "the child deadline starts at dequeue, which happens after the 1s polling
+    // interval"). They exercise timeout/cancellation SEMANTICS, not dispatch latency, so we run them
+    // with the enqueue wake off to preserve exactly that staged timing. The wake behavior itself is
+    // covered by tests/wake_on_enqueue.test.ts.
+    config.enableWakeNotifications = false;
     await setUpDBOSTestSysDb(config);
     DBOS.setConfig(config);
   });
@@ -2875,6 +2881,10 @@ describe('bounded-lane dispatcher', () => {
           await hooks.onPoll?.(queue.name);
           return [];
         },
+        // A no-wake double: these tests exercise poll/lane behavior, not enqueue wakes, so the
+        // scheduler's registerQueueWake returns undefined (wakes off) and deregister is a no-op.
+        registerQueueWake: () => undefined,
+        deregisterQueueWake: () => {},
       },
     } as unknown as DBOSExecutor;
   }

@@ -218,6 +218,9 @@ export function translateDbosConfig(options: DBOSConfig, forceConsole: boolean =
     maxConcurrentQueueDispatches: options.maxConcurrentQueueDispatches,
     useListenNotify: options.useListenNotify ?? true,
     notificationCoalesceMs: options.notificationCoalesceMs,
+    // Fork default ON: the wakes are coalesced and transition-scoped, so they cost the common case
+    // nothing measurable. A write-saturated deployment can set false to pay literally nothing.
+    enableWakeNotifications: options.enableWakeNotifications ?? true,
   };
 }
 

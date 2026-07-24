@@ -78,8 +78,35 @@ export const DBOS_NOTIFICATIONS_CHANNEL = 'dbos_notifications_channel';
 export const DBOS_WORKFLOW_EVENTS_CHANNEL = 'dbos_workflow_events_channel';
 export const DBOS_STREAMS_CHANNEL = 'dbos_streams_channel';
 
+// Wake channels: hint-only wakes for the queue scheduler (enqueue) and getResult
+// waiters (completion). CRITICALLY, and unlike the three channels above, these carry
+// NO DB trigger on workflow_status. That table is the hottest in the system — kraftp
+// benchmarked >40K updates/s (>10K/s seen in production), orders of magnitude above
+// the notifications/events/streams tables — so a per-row trigger+NOTIFY on it is
+// prohibitive. Instead these wakes are emitted APP-SIDE and ONLY at ENQUEUED- and
+// terminal-transitions (a tiny fraction of status-table traffic: ~one per workflow
+// start and one per workflow finish, never per update) and are COALESCED through the
+// existing notifier (see DEFAULT_NOTIFICATION_COALESCE_MS / #signalNotification), so
+// the worst-case NOTIFY rate is bounded by the coalesce window regardless of workflow
+// throughput. The poll loop remains the untouched correctness floor: a dropped or
+// disabled wake costs at most one poll interval, never a lost workflow.
+export const DBOS_QUEUE_WAKEUP_CHANNEL = 'dbos_queue_wakeup';
+export const DBOS_WORKFLOW_COMPLETION_CHANNEL = 'dbos_workflow_completion';
+// The single well-known key the queue scheduler registers its wake under. The woken
+// queue's name rides as the callback event payload (not the map key), so one
+// registration serves every queue and a wake can target a single queue.
+export const QUEUE_WAKEUP_KEY = 'dbos_queue_wakeup';
+
 // Interval for coalescing LISTEN/NOTIFY notifications off the write path; caps the rate of notifying commits regardless of write throughput.
 export const DEFAULT_NOTIFICATION_COALESCE_MS = 10;
+
+// Workflow statuses that are terminal — reaching one wakes a getResult() waiter on the completion channel.
+const TERMINAL_WORKFLOW_STATUSES: ReadonlySet<string> = new Set([
+  StatusString.SUCCESS,
+  StatusString.ERROR,
+  StatusString.CANCELLED,
+  StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+]);
 
 export interface WorkflowScheduleInternal {
   scheduleId: string;
@@ -690,9 +717,17 @@ export class SystemDatabase {
   dbPollingIntervalResultMs: number = 1000;
   dbPollingIntervalEventMs: number = 10000;
   shouldUseDBNotifications: boolean = true;
+  // Wake-on-enqueue (fork): gates the app-side ENQUEUED/terminal wakes independently of
+  // shouldUseDBNotifications, so the hottest workloads (see the wake-channel note above)
+  // can pay literally nothing by turning wakes off while streams/events/recv NOTIFY stays on.
+  readonly wakeNotificationsEnabled: boolean = true;
   readonly notificationsMap: NotificationMap<void> = new NotificationMap();
   readonly workflowEventsMap: NotificationMap<void> = new NotificationMap();
   readonly streamsMap: NotificationMap<void> = new NotificationMap();
+  // Queue-scheduler wakes: the woken queue name rides as the callback event; keyed by QUEUE_WAKEUP_KEY.
+  readonly queueWakeMap: NotificationMap<string> = new NotificationMap();
+  // getResult() completion wakes: keyed by workflow id.
+  readonly completionMap: NotificationMap<void> = new NotificationMap();
   customPool: boolean = false;
 
   // Interval for coalescing LISTEN/NOTIFY notifications pushed off the write path (Postgres + L/N only).
@@ -730,10 +765,14 @@ export class SystemDatabase {
     useListenNotify: boolean = true,
     pollingConcurrency?: number,
     notificationCoalesceMs: number = DEFAULT_NOTIFICATION_COALESCE_MS,
+    wakeNotificationsEnabled: boolean = true,
   ) {
     this.schemaName = schemaName;
     this.shouldUseDBNotifications = useListenNotify;
     this.notificationCoalesceMs = notificationCoalesceMs;
+    // Wakes need LISTEN/NOTIFY to reach other processes, so they are additionally gated on
+    // shouldUseDBNotifications; the flag lets a deployment keep NOTIFY on but wakes off.
+    this.wakeNotificationsEnabled = useListenNotify && wakeNotificationsEnabled;
 
     if (systemDatabasePool) {
       this.pool = systemDatabasePool;
@@ -823,6 +862,9 @@ export class SystemDatabase {
   }> {
     const client = await this.pool.connect();
     let shouldCommit = false;
+    // Set on the committed enqueue path (fresh ENQUEUED row with a queue); emitted after COMMIT
+    // so the scheduler wakes for a real, visible enqueue rather than a rolled-back or dequeued one.
+    let enqueueWakeQueue: string | undefined = undefined;
     try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
 
@@ -880,6 +922,11 @@ export class SystemDatabase {
         throw new DBOSMaxRecoveryAttemptsExceededError(initStatus.workflowUUID, options.maxRetries);
       }
       this.logger.debug(`Workflow ${initStatus.workflowUUID} attempt number: ${attempts}.`);
+      // Enqueue-transition wake: only for a fresh ENQUEUED row on a queue (not DELAYED, which
+      // transitionDelayedWorkflows wakes when due, nor a PENDING dequeue). One wake per start.
+      if (initStatus.status === StatusString.ENQUEUED && initStatus.queueName) {
+        enqueueWakeQueue = initStatus.queueName;
+      }
       return {
         status,
         deadlineEpochMS,
@@ -890,6 +937,10 @@ export class SystemDatabase {
       try {
         if (shouldCommit) {
           await client.query('COMMIT');
+          // Wake the queue scheduler now that the ENQUEUED row is committed and visible.
+          if (enqueueWakeQueue !== undefined) {
+            this.#signalWake(DBOS_QUEUE_WAKEUP_CHANNEL, enqueueWakeQueue);
+          }
           await debugTriggerPoint(DEBUG_TRIGGER_INITWF_COMMIT);
         } else {
           await client.query('ROLLBACK');
@@ -1075,6 +1126,17 @@ export class SystemDatabase {
       throw e;
     } finally {
       client.release();
+    }
+    // Enqueue-transition wake, one per distinct queue actually inserted (coalesced downstream), so a
+    // batch of N onto one queue collapses to a single NOTIFY rather than N.
+    const wokenQueues = new Set<string>();
+    for (const status of statuses) {
+      if (inserted.has(status.workflowUUID) && status.queueName) {
+        wokenQueues.add(status.queueName);
+      }
+    }
+    for (const queueName of wokenQueues) {
+      this.#signalWake(DBOS_QUEUE_WAKEUP_CHANNEL, queueName);
     }
     return inserted;
   }
@@ -1381,15 +1443,21 @@ export class SystemDatabase {
   }
 
   async #cancelWorkflows(workflowIDs: string[]): Promise<void> {
-    await this.pool.query(
+    const res = await this.pool.query<{ workflow_uuid: string }>(
       `UPDATE "${this.schemaName}".workflow_status
        SET status = $1, queue_name = NULL, deduplication_id = NULL, started_at_epoch_ms = NULL,
            updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
            completed_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint
        WHERE workflow_uuid = ANY($2)
-         AND status NOT IN ($3, $4)`,
+         AND status NOT IN ($3, $4)
+       RETURNING workflow_uuid`,
       [StatusString.CANCELLED, workflowIDs, StatusString.SUCCESS, StatusString.ERROR],
     );
+    // Completion wake: CANCELLED is terminal, and this bulk path bypasses updateWorkflowStatus,
+    // so it wakes getResult() waiters itself — one per row that actually transitioned.
+    for (const row of res.rows) {
+      this.#signalWake(DBOS_WORKFLOW_COMPLETION_CHANNEL, row.workflow_uuid);
+    }
   }
 
   @dbRetry()
@@ -1398,7 +1466,8 @@ export class SystemDatabase {
   }
 
   async resumeWorkflows(workflowIDs: string[], queueName?: string): Promise<void> {
-    await this.pool.query(
+    const targetQueue = queueName ?? INTERNAL_QUEUE_NAME;
+    const res = await this.pool.query<{ workflow_uuid: string }>(
       `UPDATE "${this.schemaName}".workflow_status
        SET status = $1, queue_name = $2, recovery_attempts = 0,
            workflow_deadline_epoch_ms = NULL, deduplication_id = NULL,
@@ -1406,9 +1475,14 @@ export class SystemDatabase {
            updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
            completed_at = NULL
        WHERE workflow_uuid = ANY($3)
-         AND status NOT IN ($4, $5)`,
-      [StatusString.ENQUEUED, queueName ?? INTERNAL_QUEUE_NAME, workflowIDs, StatusString.SUCCESS, StatusString.ERROR],
+         AND status NOT IN ($4, $5)
+       RETURNING workflow_uuid`,
+      [StatusString.ENQUEUED, targetQueue, workflowIDs, StatusString.SUCCESS, StatusString.ERROR],
     );
+    // Resume re-enqueues onto a single queue; one wake covers the whole batch.
+    if ((res.rowCount ?? 0) > 0) {
+      this.#signalWake(DBOS_QUEUE_WAKEUP_CHANNEL, targetQueue);
+    }
   }
 
   async setWorkflowPriority(workflowID: string, priority: number): Promise<void> {
@@ -2160,41 +2234,63 @@ export class SystemDatabase {
     }
 
     while (true) {
-      if (callerID) await this.#checkIfCanceledLimited(callerID);
+      // Register the completion wait BEFORE reading (mirroring recv/getEvent) so a terminal
+      // transition landing between the SELECT and the wait still wakes this iteration. Undefined
+      // when wakes are disabled — the loop then behaves exactly as the pre-existing poll loop.
+      let resolveNotification: () => void;
+      const completionPromise = new Promise<void>((resolve) => {
+        resolveNotification = resolve;
+      });
+      const cbr = this.wakeNotificationsEnabled
+        ? this.completionMap.registerCallback(workflowID, resolveNotification!)
+        : undefined;
       try {
-        const { rows } = await this.#pollWithLimiter(() =>
-          this.pool.query<workflow_status>(
-            `SELECT status, output, error, serialization FROM "${this.schemaName}".workflow_status
-             WHERE workflow_uuid=$1`,
-            [workflowID],
-          ),
-        );
-        if (rows.length > 0) {
-          const status = rows[0].status;
-          if (status === StatusString.SUCCESS) {
-            return { output: rows[0].output, serialization: rows[0].serialization };
-          } else if (status === StatusString.ERROR) {
-            return { error: rows[0].error, serialization: rows[0].serialization };
-          } else if (status === StatusString.CANCELLED) {
-            return { cancelled: true };
-          } else if (status === StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED) {
-            return { maxRecoveryAttemptsExceeded: true };
-          } else {
-            // Status is not actionable
+        if (callerID) await this.#checkIfCanceledLimited(callerID);
+        try {
+          const { rows } = await this.#pollWithLimiter(() =>
+            this.pool.query<workflow_status>(
+              `SELECT status, output, error, serialization FROM "${this.schemaName}".workflow_status
+               WHERE workflow_uuid=$1`,
+              [workflowID],
+            ),
+          );
+          if (rows.length > 0) {
+            const status = rows[0].status;
+            if (status === StatusString.SUCCESS) {
+              return { output: rows[0].output, serialization: rows[0].serialization };
+            } else if (status === StatusString.ERROR) {
+              return { error: rows[0].error, serialization: rows[0].serialization };
+            } else if (status === StatusString.CANCELLED) {
+              return { cancelled: true };
+            } else if (status === StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED) {
+              return { maxRecoveryAttemptsExceeded: true };
+            } else {
+              // Status is not actionable
+            }
           }
+        } catch (e) {
+          const err = e as Error;
+          this.logger.error(`Exception from system database: ${err}`, err);
+          throw err;
         }
-      } catch (e) {
-        const err = e as Error;
-        this.logger.error(`Exception from system database: ${err}`, err);
-        throw err;
+
+        const ct = Date.now();
+        if (finishTime && ct > finishTime) return undefined; // Time's up
+
+        let poll = finishTime ? finishTime - Date.now() : pollIntervalMs;
+        poll = Math.min(pollIntervalMs, poll);
+        // Race the terminal-status notification against the poll: whichever fires first ends the
+        // wait. pollIntervalMs (default dbPollingIntervalResultMs = 1000) is the untouched floor,
+        // so a dropped NOTIFY or disabled wake costs at most one interval, never a hang.
+        const { promise, cancel } = cancellableSleep(poll);
+        try {
+          await Promise.race([completionPromise, promise]);
+        } finally {
+          cancel();
+        }
+      } finally {
+        if (cbr) this.completionMap.deregisterCallback(cbr);
       }
-
-      const ct = Date.now();
-      if (finishTime && ct > finishTime) return undefined; // Time's up
-
-      let poll = finishTime ? finishTime - Date.now() : pollIntervalMs;
-      poll = Math.min(pollIntervalMs, poll);
-      await sleepms(poll);
     }
   }
 
@@ -2841,6 +2937,37 @@ export class SystemDatabase {
     batch.add(payload);
   }
 
+  // Coalesce a hint-only queue/completion wake. Fires ONLY from ENQUEUED/terminal transition
+  // sites, never per-update, and rides the same coalescing notifier as streams/events, so its
+  // NOTIFY rate is bounded by notificationCoalesceMs regardless of workflow_status write volume
+  // (see the wake-channel note above). A no-op when wakes are disabled, so the hottest workloads
+  // pay nothing. The poll loop stays the correctness floor, so a dropped wake only costs latency.
+  #signalWake(channel: string, payload: string): void {
+    if (!this.wakeNotificationsEnabled) {
+      return;
+    }
+    this.#signalNotification(channel, payload);
+  }
+
+  /**
+   * Register the queue scheduler's wake callback so an ENQUEUED-transition NOTIFY can trip its
+   * dispatch loop before the next poll. The callback receives the woken queue's name. Returns a
+   * deregistration handle, or `undefined` when wakes are disabled (the caller then relies on the
+   * poll floor). Symmetric to how recv/getEvent register on their notification maps.
+   */
+  registerQueueWake(cb: (queueName?: string) => void): { key: string; ck: number } | undefined {
+    if (!this.wakeNotificationsEnabled) {
+      return undefined;
+    }
+    return this.queueWakeMap.registerCallback(QUEUE_WAKEUP_KEY, cb);
+  }
+
+  deregisterQueueWake(handle: { key: string; ck: number } | undefined): void {
+    if (handle) {
+      this.queueWakeMap.deregisterCallback(handle);
+    }
+  }
+
   // Periodically flush coalesced notifications across all channels, keeping the notifying commit off the write path.
   async #runNotifier(): Promise<void> {
     while (this.#notifierActive) {
@@ -2987,13 +3114,26 @@ export class SystemDatabase {
     // Transition workflows from DELAYED to ENQUEUED when their delay has expired.
     // For debounced workflows, clear the deduplication ID in the same atomic update: it is a
     // debounce key held only while DELAYED, so a later same-key debounce starts a fresh workflow.
-    await this.pool.query(
+    const res = await this.pool.query<{ queue_name: string | null }>(
       `UPDATE "${this.schemaName}".workflow_status
        SET status = $1, updated_at = $2,
            deduplication_id = CASE WHEN is_debounced THEN NULL ELSE deduplication_id END
-       WHERE status = $3 AND delay_until_epoch_ms <= $2`,
+       WHERE status = $3 AND delay_until_epoch_ms <= $2
+       RETURNING queue_name`,
       [StatusString.ENQUEUED, Date.now(), StatusString.DELAYED],
     );
+    // Enqueue-transition wake per distinct queue that actually had a row become due. This is the
+    // same NOTIFY path other processes' schedulers hear, so a delayed workflow whose queue is
+    // dispatched elsewhere no longer waits a full poll interval past its delay.
+    const wokenQueues = new Set<string>();
+    for (const row of res.rows) {
+      if (row.queue_name) {
+        wokenQueues.add(row.queue_name);
+      }
+    }
+    for (const queueName of wokenQueues) {
+      this.#signalWake(DBOS_QUEUE_WAKEUP_CHANNEL, queueName);
+    }
   }
 
   async clearQueueAssignment(workflowID: string): Promise<boolean> {
@@ -3001,11 +3141,17 @@ export class SystemDatabase {
     const wqRes = await this.pool.query<workflow_status>(
       `UPDATE "${this.schemaName}".workflow_status
         SET started_at_epoch_ms = NULL, status = $2
-        WHERE workflow_uuid = $1 AND queue_name is NOT NULL AND status = $3`,
+        WHERE workflow_uuid = $1 AND queue_name is NOT NULL AND status = $3
+        RETURNING queue_name`,
       [workflowID, StatusString.ENQUEUED, StatusString.PENDING],
     );
     // If no rows were affected, the workflow is not anymore in the queue or was already completed
-    return (wqRes.rowCount ?? 0) > 0;
+    const cleared = (wqRes.rowCount ?? 0) > 0;
+    // Enqueue-transition wake: this row went back to ENQUEUED and is dispatchable again now.
+    if (cleared && wqRes.rows[0]?.queue_name) {
+      this.#signalWake(DBOS_QUEUE_WAKEUP_CHANNEL, wqRes.rows[0].queue_name);
+    }
+    return cleared;
   }
 
   @dbRetry()
@@ -4364,6 +4510,14 @@ export class SystemDatabase {
       args,
     );
 
+    // Completion wake: one row actually reached a terminal status here — wake any getResult() waiter.
+    // This is the central status writer for SUCCESS/ERROR/MAX_RECOVERY (bulk CANCELLED wakes in
+    // #cancelWorkflows), so terminal transitions are covered without a per-update trigger. The signal
+    // is in-memory and coalesced; the notifier flushes it off the write path, after this txn commits.
+    if (result.rowCount === 1 && TERMINAL_WORKFLOW_STATUSES.has(status)) {
+      this.#signalWake(DBOS_WORKFLOW_COMPLETION_CHANNEL, workflowID);
+    }
+
     const throwOnFailure = options.throwOnFailure ?? true;
     if (throwOnFailure && result.rowCount !== 1) {
       throw new DBOSWorkflowConflictError(`Attempt to record transition of nonexistent workflow ${workflowID}`);
@@ -4551,6 +4705,12 @@ export class SystemDatabase {
         await client.query(`LISTEN ${DBOS_NOTIFICATIONS_CHANNEL};`);
         await client.query(`LISTEN ${DBOS_WORKFLOW_EVENTS_CHANNEL};`);
         await client.query(`LISTEN ${DBOS_STREAMS_CHANNEL};`);
+        // Wake channels are subscribed only when wakes are enabled, so a wakes-off deployment
+        // opens no extra subscription. Both wakes remain gated on shouldUseDBNotifications above.
+        if (this.wakeNotificationsEnabled) {
+          await client.query(`LISTEN ${DBOS_QUEUE_WAKEUP_CHANNEL};`);
+          await client.query(`LISTEN ${DBOS_WORKFLOW_COMPLETION_CHANNEL};`);
+        }
 
         // Self-test: verify LISTEN actually works by sending a NOTIFY and checking it arrives.
         // If a transaction-mode pooler (e.g. PgBouncer pool_mode=transaction) is in the path,
@@ -4585,6 +4745,12 @@ export class SystemDatabase {
             this.workflowEventsMap.callCallbacks(msg.payload);
           } else if (msg.channel === DBOS_STREAMS_CHANNEL && msg.payload) {
             this.streamsMap.callCallbacks(msg.payload);
+          } else if (msg.channel === DBOS_QUEUE_WAKEUP_CHANNEL && msg.payload) {
+            // Payload is the woken queue name; deliver it as the callback event under the single key.
+            this.queueWakeMap.callCallbacks(QUEUE_WAKEUP_KEY, msg.payload);
+          } else if (msg.channel === DBOS_WORKFLOW_COMPLETION_CHANNEL && msg.payload) {
+            // Payload is the completed workflow id; wake any getResult() waiter registered on it.
+            this.completionMap.callCallbacks(msg.payload);
           }
         };
 

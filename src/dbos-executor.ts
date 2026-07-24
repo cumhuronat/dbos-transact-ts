@@ -168,6 +168,15 @@ export interface DBOSConfig {
   useListenNotify?: boolean;
   /** Interval (ms) for coalescing LISTEN/NOTIFY notifications (streams and events) off the write path; bounds read latency. Default 10, min 1. */
   notificationCoalesceMs?: number;
+  /**
+   * Enable the hint-only wake NOTIFYs for queue enqueue and workflow completion (default true).
+   * These are emitted app-side ONLY at ENQUEUED/terminal transitions and coalesced, so they carry
+   * no per-update cost on the workflow_status table; the poll loop is the unchanged correctness
+   * floor. Set false to keep streams/events/recv NOTIFY on while paying nothing for wakes — for the
+   * most write-heavy workloads (workflow_status seen at >40K updates/s). Also requires
+   * useListenNotify; it is a no-op wherever LISTEN/NOTIFY is unavailable.
+   */
+  enableWakeNotifications?: boolean;
 }
 
 export interface DBOSRuntimeConfig {
@@ -224,6 +233,7 @@ export type DBOSConfigInternal = {
   maxConcurrentQueueDispatches?: number;
   useListenNotify: boolean;
   notificationCoalesceMs?: number;
+  enableWakeNotifications: boolean;
 
   http?: {
     cors_middleware?: boolean;
@@ -347,6 +357,7 @@ export class DBOSExecutor {
         this.config.useListenNotify,
         this.config.systemDatabasePollingConcurrency,
         this.config.notificationCoalesceMs,
+        this.config.enableWakeNotifications,
       );
     }
 
