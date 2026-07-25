@@ -1280,6 +1280,8 @@ export class DBOSExecutor {
 
   async initEventReceivers(listenQueues: (WorkflowQueue | string)[] | null) {
     this.#wfqEnded = wfQueueRunner.dispatchLoop(this, listenQueues, this.config.maxConcurrentQueueDispatches);
+    // Mark an immediate startup rejection as handled while preserving it for deactivateEventReceivers to observe.
+    void this.#wfqEnded.catch(() => undefined);
 
     for (const lcl of getLifecycleListeners()) {
       await lcl.initialize?.();

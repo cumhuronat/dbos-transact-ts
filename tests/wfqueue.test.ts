@@ -2848,6 +2848,118 @@ describe('concurrent-queue-dispatches', () => {
   }, 30000);
 });
 
+describe('workflow-queue root quiesce', () => {
+  const rootQueueName = 'quiesce-root-queue';
+  const childQueueName = 'quiesce-child-queue';
+
+  class QuiesceDrainWFs {
+    static parentStarted = new Event();
+    static releaseParent = new Event();
+
+    static reset(): void {
+      QuiesceDrainWFs.parentStarted = new Event();
+      QuiesceDrainWFs.releaseParent = new Event();
+    }
+
+    @DBOS.workflow()
+    static async parent(childCount: number, queueName: string = childQueueName): Promise<number[]> {
+      QuiesceDrainWFs.parentStarted.set();
+      await QuiesceDrainWFs.releaseParent.wait();
+      const children = await Promise.all(
+        Array.from({ length: childCount }, (_, value) =>
+          DBOS.startWorkflow(QuiesceDrainWFs, { queueName }).child(value),
+        ),
+      );
+      return Promise.all(children.map((handle) => handle.getResult()));
+    }
+
+    @DBOS.workflow()
+    static async child(value: number): Promise<number> {
+      await sleepms(25);
+      return value;
+    }
+
+    @DBOS.workflow()
+    static root(): Promise<string> {
+      return Promise.resolve('new-root-ran');
+    }
+  }
+
+  let config: DBOSConfig;
+  let cleanupWorkflowIDs: string[];
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+  });
+
+  beforeEach(async () => {
+    QuiesceDrainWFs.reset();
+    cleanupWorkflowIDs = [];
+    DBOS.setConfig(config);
+    await DBOS.launch();
+    await DBOS.registerQueue(rootQueueName, {
+      workerConcurrency: 1,
+      minPollingIntervalMs: 25,
+      onConflict: 'always_update',
+    });
+    await DBOS.registerQueue(childQueueName, {
+      workerConcurrency: 2,
+      minPollingIntervalMs: 25,
+      onConflict: 'always_update',
+    });
+  });
+
+  afterEach(async () => {
+    QuiesceDrainWFs.releaseParent.set();
+    await Promise.allSettled(cleanupWorkflowIDs.map((workflowID) => DBOS.cancelWorkflow(workflowID)));
+    await Promise.allSettled([DBOS.deleteQueue(rootQueueName), DBOS.deleteQueue(childQueueName)]);
+    await DBOS.shutdown();
+  });
+
+  test('drains descendants beyond worker concurrency while leaving later roots enqueued', async () => {
+    const parent = await DBOS.startWorkflow(QuiesceDrainWFs, { queueName: rootQueueName }).parent(7);
+    cleanupWorkflowIDs.push(parent.workflowID);
+    await QuiesceDrainWFs.parentStarted.wait();
+
+    const backlogRoot = await DBOS.startWorkflow(QuiesceDrainWFs, { queueName: rootQueueName }).root();
+    cleanupWorkflowIDs.push(backlogRoot.workflowID);
+    await expect(backlogRoot.getStatus()).resolves.toMatchObject({ status: StatusString.ENQUEUED });
+
+    await DBOS.quiesceWorkflowQueueRoots();
+    const laterRoot = await DBOS.startWorkflow(QuiesceDrainWFs, { queueName: rootQueueName }).root();
+    cleanupWorkflowIDs.push(laterRoot.workflowID);
+    QuiesceDrainWFs.releaseParent.set();
+
+    await expect(parent.getResult()).resolves.toEqual([0, 1, 2, 3, 4, 5, 6]);
+    await sleepms(200);
+    await expect(backlogRoot.getStatus()).resolves.toMatchObject({ status: StatusString.ENQUEUED });
+    await expect(laterRoot.getStatus()).resolves.toMatchObject({ status: StatusString.ENQUEUED });
+  }, 15000);
+
+  test('drains descendants queued behind an older root on the same queue', async () => {
+    const parent = await DBOS.startWorkflow(QuiesceDrainWFs, { queueName: rootQueueName }).parent(5, rootQueueName);
+    cleanupWorkflowIDs.push(parent.workflowID);
+    await QuiesceDrainWFs.parentStarted.wait();
+
+    const backlogRoot = await DBOS.startWorkflow(QuiesceDrainWFs, { queueName: rootQueueName }).root();
+    cleanupWorkflowIDs.push(backlogRoot.workflowID);
+    await expect(backlogRoot.getStatus()).resolves.toMatchObject({ status: StatusString.ENQUEUED });
+
+    await DBOS.quiesceWorkflowQueueRoots();
+    await DBOS.registerQueue(rootQueueName, {
+      workerConcurrency: 2,
+      minPollingIntervalMs: 25,
+      onConflict: 'always_update',
+    });
+    QuiesceDrainWFs.releaseParent.set();
+
+    await expect(parent.getResult()).resolves.toEqual([0, 1, 2, 3, 4]);
+    await sleepms(200);
+    await expect(backlogRoot.getStatus()).resolves.toMatchObject({ status: StatusString.ENQUEUED });
+  }, 15000);
+});
+
 /**
  * Scheduler-level invariants of the bounded-lane dispatcher, driven against a mock executor:
  * the lane ceiling, lane release, wake latency, and the shutdown drain. These are properties of
@@ -2859,9 +2971,11 @@ describe('concurrent-queue-dispatches', () => {
 describe('bounded-lane dispatcher', () => {
   interface MockHooks {
     /** Runs inside findAndMarkStartableWorkflows, i.e. while the queue's lane is held. */
-    onPoll?: (queueName: string) => Promise<void>;
+    onPoll?: (queueName: string, descendantsOnly: boolean) => Promise<void>;
     /** Runs inside transitionDelayedWorkflows, i.e. while the scheduler loop is mid-body. */
     onTransition?: () => Promise<void>;
+    /** Runs when the scheduler releases its enqueue-wake subscription. */
+    onDeregister?: () => void;
   }
 
   function mockExecutor(hooks: MockHooks): DBOSExecutor {
@@ -2875,22 +2989,41 @@ describe('bounded-lane dispatcher', () => {
         transitionDelayedWorkflows: async () => {
           await hooks.onTransition?.();
         },
-        findAndMarkStartableWorkflows: async (queue: WorkflowQueue) => {
+        findAndMarkStartableWorkflows: async (
+          queue: WorkflowQueue,
+          _executorID: string,
+          _appVersion: string,
+          _partitionKey: string | undefined,
+          descendantsOnly: boolean,
+        ) => {
           // An earlier DBOS.launch() registered the internal queue globally; skip it to keep counters clean.
           if (queue.name === INTERNAL_QUEUE_NAME) return [];
-          await hooks.onPoll?.(queue.name);
+          await hooks.onPoll?.(queue.name, descendantsOnly);
           return [];
         },
         // A no-wake double: these tests exercise poll/lane behavior, not enqueue wakes, so the
         // scheduler's registerQueueWake returns undefined (wakes off) and deregister is a no-op.
         registerQueueWake: () => undefined,
-        deregisterQueueWake: () => {},
+        deregisterQueueWake: () => hooks.onDeregister?.(),
       },
     } as unknown as DBOSExecutor;
   }
 
   let seq = 0;
   const registered: WorkflowQueue[] = [];
+  const activeLoops = new Set<Promise<void>>();
+  const cleanupActions: Array<() => void> = [];
+
+  function startDispatchLoop(
+    exec: DBOSExecutor,
+    queues: WorkflowQueue[],
+    maxConcurrentQueueDispatches?: number,
+  ): Promise<void> {
+    const loop = wfQueueRunner.dispatchLoop(exec, queues, maxConcurrentQueueDispatches);
+    activeLoops.add(loop);
+    void loop.finally(() => activeLoops.delete(loop)).catch(() => undefined);
+    return loop;
+  }
   /** Register N continuously-due in-memory queues under names unique to this test. */
   function makeQueues(count: number): WorkflowQueue[] {
     const tag = `lane-${seq++}`;
@@ -2902,13 +3035,16 @@ describe('bounded-lane dispatcher', () => {
     return queues;
   }
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (const cleanup of cleanupActions) cleanup();
     wfQueueRunner.stop();
+    await Promise.allSettled(Array.from(activeLoops));
     // Restores any global patched via jest.spyOn below; runs even when a test times out.
     jest.restoreAllMocks();
     // The constructor registers globally, so unregister: a later DBOS.launch() would dispatch these.
     for (const q of registered) wfQueueRunner.wfQueuesByName.delete(q.name);
     registered.length = 0;
+    cleanupActions.length = 0;
   });
 
   test('never runs more concurrent polls than maxConcurrentQueueDispatches', async () => {
@@ -2926,7 +3062,7 @@ describe('bounded-lane dispatcher', () => {
       },
     });
 
-    const loop = wfQueueRunner.dispatchLoop(exec, queues, LIMIT);
+    const loop = startDispatchLoop(exec, queues, LIMIT);
     await sleepms(800);
     wfQueueRunner.stop();
     await loop;
@@ -2952,7 +3088,7 @@ describe('bounded-lane dispatcher', () => {
       },
     });
 
-    const loop = wfQueueRunner.dispatchLoop(exec, queues);
+    const loop = startDispatchLoop(exec, queues);
     await sleepms(800);
     wfQueueRunner.stop();
     await loop;
@@ -2984,7 +3120,7 @@ describe('bounded-lane dispatcher', () => {
       return realSetTimeout(fn, delay, ...rest);
     }) as unknown as typeof global.setTimeout);
 
-    const loop = wfQueueRunner.dispatchLoop(exec, queues, 2);
+    const loop = startDispatchLoop(exec, queues, 2);
     await sleepms(800);
     wfQueueRunner.stop();
     await loop;
@@ -3009,7 +3145,7 @@ describe('bounded-lane dispatcher', () => {
       },
     });
 
-    const loop = wfQueueRunner.dispatchLoop(exec, queues, 3);
+    const loop = startDispatchLoop(exec, queues, 3);
     await sleepms(500);
     wfQueueRunner.stop();
     await loop;
@@ -3032,7 +3168,7 @@ describe('bounded-lane dispatcher', () => {
       },
     });
 
-    const loop = wfQueueRunner.dispatchLoop(exec, queues, 2);
+    const loop = startDispatchLoop(exec, queues, 2);
     await sleepms(800);
     wfQueueRunner.stop();
     await loop;
@@ -3058,7 +3194,7 @@ describe('bounded-lane dispatcher', () => {
       },
     });
 
-    const loop = wfQueueRunner.dispatchLoop(exec, queues, 1);
+    const loop = startDispatchLoop(exec, queues, 1);
     await sleepms(800);
     wfQueueRunner.stop();
     await loop;
@@ -3084,7 +3220,7 @@ describe('bounded-lane dispatcher', () => {
       },
     });
 
-    const loop = wfQueueRunner.dispatchLoop(exec, queues, 1);
+    const loop = startDispatchLoop(exec, queues, 1);
     await sleepms(600);
     wfQueueRunner.stop();
     await loop;
@@ -3121,7 +3257,8 @@ describe('bounded-lane dispatcher', () => {
       },
     });
 
-    const loop = wfQueueRunner.dispatchLoop(exec, queues, 2);
+    cleanupActions.push(() => releaseTransition?.());
+    const loop = startDispatchLoop(exec, queues, 2);
 
     const deadline = Date.now() + 5000;
     while (!releaseTransition && Date.now() < deadline) {
@@ -3150,7 +3287,7 @@ describe('bounded-lane dispatcher', () => {
       },
     });
 
-    const loop = wfQueueRunner.dispatchLoop(exec, queues, 1);
+    const loop = startDispatchLoop(exec, queues, 1);
 
     const deadline = Date.now() + 5000;
     while (!pollStarted && Date.now() < deadline) {
@@ -3165,4 +3302,183 @@ describe('bounded-lane dispatcher', () => {
 
     expect(order).toEqual(['poll-finished', 'loop-resolved']);
   }, 15000);
+
+  test('quiesce forms a barrier and restricts later polls to descendants', async () => {
+    const observations: boolean[] = [];
+    let firstPollStarted = false;
+    let releaseFirstPoll: (() => void) | undefined;
+    const queues = makeQueues(1);
+    const exec = mockExecutor({
+      onPoll: async (_name, descendantsOnly) => {
+        observations.push(descendantsOnly);
+        if (!firstPollStarted) {
+          firstPollStarted = true;
+          await new Promise<void>((resolve) => {
+            releaseFirstPoll = resolve;
+          });
+        }
+      },
+    });
+
+    cleanupActions.push(() => releaseFirstPoll?.());
+    const loop = startDispatchLoop(exec, queues, 1);
+    const startDeadline = Date.now() + 5000;
+    while (!releaseFirstPoll && Date.now() < startDeadline) {
+      await sleepms(5);
+    }
+    expect(releaseFirstPoll).toBeDefined();
+
+    let quiesced = false;
+    const barrier = wfQueueRunner.quiesceRootWorkflows().then(() => {
+      quiesced = true;
+    });
+    await sleepms(50);
+    expect(quiesced).toBe(false);
+
+    releaseFirstPoll!();
+    await barrier;
+    expect(observations[0]).toBe(false);
+    expect(observations.slice(1).every(Boolean)).toBe(true);
+
+    const descendantPollDeadline = Date.now() + 5000;
+    while (observations.length < 2 && Date.now() < descendantPollDeadline) {
+      await sleepms(5);
+    }
+    wfQueueRunner.stop();
+    await loop;
+
+    expect(observations.length).toBeGreaterThan(1);
+    expect(observations.slice(1).every(Boolean)).toBe(true);
+  }, 15000);
+
+  test('rejects quiesce when the dispatcher is not running', async () => {
+    await expect(wfQueueRunner.quiesceRootWorkflows()).rejects.toThrow('queue dispatcher is not running');
+  });
+
+  test('rejects a quiesce barrier interrupted by dispatcher stop', async () => {
+    let releasePoll: (() => void) | undefined;
+    const queues = makeQueues(1);
+    const exec = mockExecutor({
+      onPoll: () =>
+        new Promise<void>((resolve) => {
+          releasePoll = resolve;
+        }),
+    });
+    cleanupActions.push(() => releasePoll?.());
+    const loop = startDispatchLoop(exec, queues, 1);
+    const deadline = Date.now() + 5000;
+    while (!releasePoll && Date.now() < deadline) await sleepms(5);
+    expect(releasePoll).toBeDefined();
+
+    const barrier = wfQueueRunner.quiesceRootWorkflows();
+    wfQueueRunner.stop();
+    releasePoll!();
+
+    await expect(barrier).rejects.toThrow('dispatcher stopped');
+    await loop;
+  }, 15000);
+
+  test('rejects overlapping dispatch loops and resets root quiescence after teardown', async () => {
+    const firstObservations: boolean[] = [];
+    const exec = mockExecutor({
+      onPoll: (_name, descendantsOnly) => {
+        firstObservations.push(descendantsOnly);
+        return Promise.resolve();
+      },
+    });
+    const first = startDispatchLoop(exec, makeQueues(1), 1);
+    const firstPollDeadline = Date.now() + 5000;
+    while (firstObservations.length === 0 && Date.now() < firstPollDeadline) await sleepms(5);
+    expect(firstObservations[0]).toBe(false);
+
+    await wfQueueRunner.quiesceRootWorkflows();
+    const quiescedPollDeadline = Date.now() + 5000;
+    while (!firstObservations.includes(true) && Date.now() < quiescedPollDeadline) await sleepms(5);
+    expect(firstObservations).toContain(true);
+    await expect(startDispatchLoop(exec, [], 1)).rejects.toThrow('another dispatcher run is still active');
+
+    wfQueueRunner.stop();
+    await first;
+
+    const restartObservations: boolean[] = [];
+    const restarted = startDispatchLoop(
+      mockExecutor({
+        onPoll: (_name, descendantsOnly) => {
+          restartObservations.push(descendantsOnly);
+          return Promise.resolve();
+        },
+      }),
+      makeQueues(1),
+      1,
+    );
+    const restartPollDeadline = Date.now() + 5000;
+    while (restartObservations.length === 0 && Date.now() < restartPollDeadline) await sleepms(5);
+    expect(restartObservations[0]).toBe(false);
+    wfQueueRunner.stop();
+    await restarted;
+  }, 15000);
+
+  test('drains in-flight polls and deregisters enqueue wakes when the scheduler throws', async () => {
+    let releasePoll: (() => void) | undefined;
+    let deregistered = false;
+    let injectedFailure = false;
+    cleanupActions.push(() => releasePoll?.());
+
+    const realSetTimeout = global.setTimeout;
+    jest.spyOn(global, 'setTimeout').mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      if (!injectedFailure && typeof delay === 'number' && delay > 500) {
+        injectedFailure = true;
+        throw new Error('synthetic scheduler loop failure');
+      }
+      return realSetTimeout(fn, delay, ...args);
+    }) as unknown as typeof global.setTimeout);
+
+    const loop = startDispatchLoop(
+      mockExecutor({
+        onPoll: () =>
+          new Promise<void>((resolve) => {
+            releasePoll = resolve;
+          }),
+        onDeregister: () => {
+          deregistered = true;
+        },
+      }),
+      makeQueues(1),
+      1,
+    );
+    let settled = false;
+    void loop
+      .finally(() => {
+        settled = true;
+      })
+      .catch(() => undefined);
+
+    const failureDeadline = Date.now() + 5000;
+    while ((!releasePoll || !injectedFailure) && Date.now() < failureDeadline) await sleepms(5);
+    expect(releasePoll).toBeDefined();
+    expect(injectedFailure).toBe(true);
+    expect(deregistered).toBe(true);
+    expect(settled).toBe(false);
+
+    releasePoll!();
+    await expect(loop).rejects.toThrow('synthetic scheduler loop failure');
+    expect(settled).toBe(true);
+  }, 15000);
+
+  test('releases dispatcher ownership when scheduler setup throws', async () => {
+    const failing = mockExecutor({});
+    (failing.systemDatabase as unknown as { registerQueueWake: () => never }).registerQueueWake = () => {
+      throw new Error('synthetic scheduler setup failure');
+    };
+    await expect(startDispatchLoop(failing, [], 1)).rejects.toThrow('synthetic scheduler setup failure');
+
+    const healthy = mockExecutor({});
+    const restarted = startDispatchLoop(healthy, [], 1);
+    wfQueueRunner.stop();
+    await restarted;
+  });
 });

@@ -3187,6 +3187,7 @@ export class SystemDatabase {
     executorID: string,
     appVersion: string,
     queuePartitionKey?: string,
+    descendantsOnly: boolean = false,
   ): Promise<string[]> {
     const startTimeMs = Date.now();
     const limiterPeriodMS = queue.rateLimit ? queue.rateLimit.periodSec * 1000 : 0;
@@ -3289,12 +3290,14 @@ export class SystemDatabase {
       const limitClause = maxTasks !== Infinity ? `LIMIT ${maxTasks}` : '';
 
       const selectParams = [StatusString.ENQUEUED, queue.name, appVersion, ...partitionParams];
+      const parentClause = descendantsOnly ? 'AND parent_workflow_id IS NOT NULL' : '';
       const selectQuery = `
         SELECT workflow_uuid
         FROM "${this.schemaName}".workflow_status
         WHERE status = $1
           AND queue_name = $2
           AND ${versionClause}
+          ${parentClause}
           ${partitionFilter.replace('$PARTITION', '$4')}
         ORDER BY priority ASC, created_at ASC
         ${limitClause}

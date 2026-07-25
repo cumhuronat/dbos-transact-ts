@@ -123,8 +123,8 @@ declare class WFQueueRunner {
      * regardless of any listenQueues filter, so this process executes what it enqueues.
      */
     readonly pollerQueueNames: Set<string>;
-    private isRunning;
-    private abortController?;
+    /** The one dispatcher run currently owned by this runner, including its shutdown barrier state. */
+    private activeRun?;
     private listenQueueNames;
     /** Per-queue scheduling state, keyed by queue name. */
     private readonly states;
@@ -139,6 +139,14 @@ declare class WFQueueRunner {
     private readonly jitterMin;
     private readonly jitterMax;
     stop(): void;
+    /**
+     * Stop claiming new root workflows without stopping the dispatcher. Existing workflow trees can
+     * therefore continue to enqueue and run children while an application drains for shutdown.
+     *
+     * The barrier waits for every poll that began before the mode change. Once this resolves, no
+     * earlier all-workflow poll can still claim a root; every later poll is descendants-only.
+     */
+    quiesceRootWorkflows(): Promise<void>;
     clearRegistrations(): void;
     dispatchLoop(exec: DBOSExecutor, listenQueuesArg: (WorkflowQueue | string)[] | null, maxConcurrentQueueDispatches?: number): Promise<void>;
     /** Resolve the listenQueues argument to the set of in-memory queues to dispatch for. */

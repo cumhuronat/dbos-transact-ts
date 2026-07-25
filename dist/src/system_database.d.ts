@@ -411,7 +411,7 @@ export declare class SystemDatabase {
     clearQueueAssignment(workflowID: string): Promise<boolean>;
     getDeduplicatedWorkflow(queueName: string, deduplicationID: string): Promise<string | null>;
     getQueuePartitions(queueName: string): Promise<string[]>;
-    findAndMarkStartableWorkflows(queue: WorkflowQueue, executorID: string, appVersion: string, queuePartitionKey?: string): Promise<string[]>;
+    findAndMarkStartableWorkflows(queue: WorkflowQueue, executorID: string, appVersion: string, queuePartitionKey?: string, descendantsOnly?: boolean): Promise<string[]>;
     listWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatusInternal[]>;
     getWorkflowAggregates(input: GetWorkflowAggregatesInput): Promise<WorkflowAggregateRow[]>;
     getStepAggregates(input: GetStepAggregatesInput): Promise<StepAggregateRow[]>;

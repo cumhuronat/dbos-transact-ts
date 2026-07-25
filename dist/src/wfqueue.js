@@ -259,8 +259,8 @@ class WFQueueRunner {
      * regardless of any listenQueues filter, so this process executes what it enqueues.
      */
     pollerQueueNames = new Set();
-    isRunning = false;
-    abortController;
+    /** The one dispatcher run currently owned by this runner, including its shutdown barrier state. */
+    activeRun;
     listenQueueNames = null;
     /** Per-queue scheduling state, keyed by queue name. */
     states = new Map();
@@ -275,38 +275,75 @@ class WFQueueRunner {
     jitterMin = 0.95;
     jitterMax = 1.05;
     stop() {
-        if (!this.isRunning)
+        const run = this.activeRun;
+        if (!run || !run.isRunning)
             return;
-        this.isRunning = false;
-        this.abortController?.abort();
+        run.isRunning = false;
+        run.abortController.abort();
+    }
+    /**
+     * Stop claiming new root workflows without stopping the dispatcher. Existing workflow trees can
+     * therefore continue to enqueue and run children while an application drains for shutdown.
+     *
+     * The barrier waits for every poll that began before the mode change. Once this resolves, no
+     * earlier all-workflow poll can still claim a root; every later poll is descendants-only.
+     */
+    async quiesceRootWorkflows() {
+        const run = this.activeRun;
+        if (!run?.isRunning) {
+            throw new Error('Cannot quiesce workflow queue roots because the queue dispatcher is not running.');
+        }
+        run.descendantsOnly = true;
+        await Promise.allSettled(Array.from(run.inFlightPolls.values()));
+        if (this.activeRun !== run || !run.isRunning) {
+            throw new Error('Workflow queue root quiescence was interrupted because the queue dispatcher stopped.');
+        }
     }
     clearRegistrations() {
         this.wfQueuesByName.clear();
         this.pollerQueueNames.clear();
     }
     async dispatchLoop(exec, listenQueuesArg, maxConcurrentQueueDispatches = 3) {
-        this.isRunning = true;
-        this.states.clear();
-        this.conflictWarned.clear();
-        this.listenQueueNames = listenQueuesArg
-            ? new Set(listenQueuesArg.map((entry) => (typeof entry === 'string' ? entry : entry.name)))
-            : null;
-        this.abortController = new AbortController();
-        const startNow = Date.now();
-        // The internal queue is process-private and bypasses the listenQueues filter.
-        const internal = this.wfQueuesByName.get(utils_1.INTERNAL_QUEUE_NAME);
-        if (internal)
-            this.ensureState(internal, startNow);
-        // Unmatched string entries are deferred to refreshDbQueues as DB-backed queues.
-        for (const q of this.resolveInMemoryQueues(listenQueuesArg)) {
-            this.ensureState(q, startNow);
+        if (this.activeRun) {
+            throw new Error('Cannot start the workflow queue dispatcher because another dispatcher run is still active.');
         }
-        // Add pre-launch DB-backed queues now so an immediate enqueue can't race the first reconcile.
-        await this.refreshDbQueues(exec, startNow);
-        // Log everything we're now dispatching for, before the loop starts.
-        this.logRunningQueues(exec);
-        // One loop drives global maintenance; queue polls run in a bounded set of independent lanes.
-        await this.schedulerLoop(exec, startNow, maxConcurrentQueueDispatches);
+        const run = {
+            abortController: new AbortController(),
+            inFlightPolls: new Map(),
+            isRunning: true,
+            descendantsOnly: false,
+        };
+        this.activeRun = run;
+        try {
+            this.states.clear();
+            this.conflictWarned.clear();
+            this.listenQueueNames = listenQueuesArg
+                ? new Set(listenQueuesArg.map((entry) => (typeof entry === 'string' ? entry : entry.name)))
+                : null;
+            const startNow = Date.now();
+            // The internal queue is process-private and bypasses the listenQueues filter.
+            const internal = this.wfQueuesByName.get(utils_1.INTERNAL_QUEUE_NAME);
+            if (internal)
+                this.ensureState(internal, startNow);
+            // Unmatched string entries are deferred to refreshDbQueues as DB-backed queues.
+            for (const q of this.resolveInMemoryQueues(listenQueuesArg)) {
+                this.ensureState(q, startNow);
+            }
+            // Add pre-launch DB-backed queues now so an immediate enqueue can't race the first reconcile.
+            await this.refreshDbQueues(exec, startNow);
+            // Log everything we're now dispatching for, before the loop starts.
+            this.logRunningQueues(exec);
+            // One loop drives global maintenance; queue polls run in a bounded set of independent lanes.
+            await this.schedulerLoop(exec, startNow, maxConcurrentQueueDispatches, run);
+        }
+        finally {
+            run.isRunning = false;
+            run.abortController.abort();
+            await Promise.allSettled(Array.from(run.inFlightPolls.values()));
+            run.inFlightPolls.clear();
+            if (this.activeRun === run)
+                this.activeRun = undefined;
+        }
     }
     /** Resolve the listenQueues argument to the set of in-memory queues to dispatch for. */
     resolveInMemoryQueues(listenQueuesArg) {
@@ -397,9 +434,8 @@ class WFQueueRunner {
         }
     }
     /** Reconcile queues and schedule due polls across a bounded number of independent lanes. */
-    async schedulerLoop(exec, startNow, maxConcurrentQueueDispatches) {
-        const signal = this.abortController.signal;
-        const inFlightPolls = new Map();
+    async schedulerLoop(exec, startNow, maxConcurrentQueueDispatches, run) {
+        const signal = run.abortController.signal;
         let wakePending = false;
         let wakeScheduler;
         const wake = () => {
@@ -418,8 +454,10 @@ class WFQueueRunner {
                 return;
             }
             await new Promise((resolve) => {
+                const timerRef = {};
                 const finish = () => {
-                    clearTimeout(timer);
+                    if (timerRef.value)
+                        clearTimeout(timerRef.value);
                     signal.removeEventListener('abort', onAbort);
                     if (wakeScheduler === finish)
                         wakeScheduler = undefined;
@@ -428,7 +466,7 @@ class WFQueueRunner {
                 const onAbort = () => finish();
                 wakeScheduler = finish;
                 signal.addEventListener('abort', onAbort, { once: true });
-                const timer = setTimeout(finish, ms);
+                timerRef.value = setTimeout(finish, ms);
             });
         };
         // Wake the scheduler when a workflow becomes ENQUEUED. The SystemDatabase emits an app-side,
@@ -453,47 +491,54 @@ class WFQueueRunner {
         let lastReconcileAt = startNow;
         // Global op: run on a fixed cadence, not once per wake (destaggered wakeups would push it to ~N/sec).
         let lastTransitionAt = 0;
-        while (this.isRunning) {
-            const now = Date.now();
-            // Reconcile DB-backed queues with a single query, independent of queue count.
-            if (now - lastReconcileAt >= WFQueueRunner.reconcileIntervalMs) {
-                await this.refreshDbQueues(exec, now);
-                lastReconcileAt = now;
-            }
-            // Transition delayed workflows at most once per interval — it is global, so one call covers every queue.
-            if (now - lastTransitionAt >= WFQueueRunner.transitionIntervalMs) {
-                try {
-                    await exec.systemDatabase.transitionDelayedWorkflows();
+        try {
+            while (run.isRunning) {
+                const now = Date.now();
+                // Reconcile DB-backed queues with a single query, independent of queue count.
+                if (now - lastReconcileAt >= WFQueueRunner.reconcileIntervalMs) {
+                    await this.refreshDbQueues(exec, now);
+                    lastReconcileAt = now;
                 }
-                catch (e) {
-                    exec.logger.warn(`Error transitioning delayed workflows: ${e.message}`);
+                // Transition delayed workflows at most once per interval — it is global, so one call covers every queue.
+                if (now - lastTransitionAt >= WFQueueRunner.transitionIntervalMs) {
+                    try {
+                        await exec.systemDatabase.transitionDelayedWorkflows();
+                    }
+                    catch (e) {
+                        exec.logger.warn(`Error transitioning delayed workflows: ${e.message}`);
+                    }
+                    lastTransitionAt = now;
                 }
-                lastTransitionAt = now;
-            }
-            this.scheduleDueQueues(exec, now, maxConcurrentQueueDispatches, inFlightPolls, wake);
-            if (!this.isRunning)
-                break;
-            // Sleep until global maintenance or an idle queue's next poll.
-            let nextWakeAt = Math.min(lastReconcileAt + WFQueueRunner.reconcileIntervalMs, lastTransitionAt + WFQueueRunner.transitionIntervalMs);
-            // Skip queue times while all lanes are busy: a completing poll wakes us, so folding a due-but-unlaned queue in would spin at 0ms.
-            if (inFlightPolls.size < maxConcurrentQueueDispatches) {
-                for (const state of this.states.values()) {
-                    if (!inFlightPolls.has(state.queue.name) && state.nextPollAt < nextWakeAt)
-                        nextWakeAt = state.nextPollAt;
+                this.scheduleDueQueues(exec, now, maxConcurrentQueueDispatches, run, wake);
+                if (!run.isRunning)
+                    break;
+                // Sleep until global maintenance or an idle queue's next poll.
+                let nextWakeAt = Math.min(lastReconcileAt + WFQueueRunner.reconcileIntervalMs, lastTransitionAt + WFQueueRunner.transitionIntervalMs);
+                // Skip queue times while all lanes are busy: a completing poll wakes us, so folding a due-but-unlaned queue in would spin at 0ms.
+                if (run.inFlightPolls.size < maxConcurrentQueueDispatches) {
+                    for (const state of this.states.values()) {
+                        if (!run.inFlightPolls.has(state.queue.name) && state.nextPollAt < nextWakeAt) {
+                            nextWakeAt = state.nextPollAt;
+                        }
+                    }
                 }
+                const sleepMs = Math.max(0, nextWakeAt - Date.now());
+                await waitForWakeOrTimeout(sleepMs);
             }
-            const sleepMs = Math.max(0, nextWakeAt - Date.now());
-            await waitForWakeOrTimeout(sleepMs);
         }
-        // Stop receiving enqueue wakes before we drain: the loop is exiting, so any further wake would
-        // only set wakePending on a dead scheduler. Safe even if the handle is undefined (wakes off).
-        exec.systemDatabase.deregisterQueueWake(queueWakeHandle);
-        await Promise.allSettled(Array.from(inFlightPolls.values()));
+        finally {
+            run.isRunning = false;
+            run.abortController.abort();
+            // Stop receiving enqueue wakes before draining, including when the scheduler exits abnormally.
+            exec.systemDatabase.deregisterQueueWake(queueWakeHandle);
+            await Promise.allSettled(Array.from(run.inFlightPolls.values()));
+        }
     }
     /** Start due queue polls up to the lane limit, in nextPollAt order so the longest-overdue queue goes first. */
-    scheduleDueQueues(exec, now, maxConcurrentQueueDispatches, inFlightPolls, wake) {
-        if (!this.isRunning)
+    scheduleDueQueues(exec, now, maxConcurrentQueueDispatches, run, wake) {
+        if (!run.isRunning)
             return;
+        const inFlightPolls = run.inFlightPolls;
         // Earliest nextPollAt first: a queue passed over while the lanes were full keeps its older
         // nextPollAt, so it outranks freshly-scheduled queues on the next pass and cannot be starved.
         const due = Array.from(this.states.values())
@@ -502,28 +547,28 @@ class WFQueueRunner {
         for (const state of due) {
             if (inFlightPolls.size >= maxConcurrentQueueDispatches)
                 break;
-            inFlightPolls.set(state.queue.name, this.runQueuePoll(exec, state, inFlightPolls, wake));
+            inFlightPolls.set(state.queue.name, this.runQueuePoll(exec, state, run, wake));
         }
     }
     /** Run one queue's poll while reserving that queue's lane until its backoff state is updated. */
-    async runQueuePoll(exec, state, inFlightPolls, wake) {
+    async runQueuePoll(exec, state, run, wake) {
         const queueName = state.queue.name;
         // pollQueue swallows DB errors, so a rejection here is abnormal: back off instead of scaling back toward the minimum interval.
         let contentionDetected = true;
         try {
-            contentionDetected = await this.pollQueue(exec, state.queue);
+            contentionDetected = await this.pollQueue(exec, state.queue, run);
         }
         catch (e) {
             exec.logger.warn(`Unexpected error polling queue ${queueName}: ${e.message}`);
         }
         finally {
             this.adjustInterval(exec, state, contentionDetected);
-            inFlightPolls.delete(queueName);
+            run.inFlightPolls.delete(queueName);
             wake();
         }
     }
     /** Poll one queue once, starting ready workflows; returns true if DB contention was detected. */
-    async pollQueue(exec, queue) {
+    async pollQueue(exec, queue, run) {
         let contentionDetected = false;
         // Helper function that starts dequeued workflows
         const dispatch = async (wfids) => {
@@ -545,13 +590,13 @@ class WFQueueRunner {
             if (queue.partitionQueue) {
                 const partitionKeys = await exec.systemDatabase.getQueuePartitions(queue.name);
                 for (const partitionKey of partitionKeys) {
-                    const partitionWfids = await exec.systemDatabase.findAndMarkStartableWorkflows(queue, exec.executorID, utils_1.globalParams.appVersion, partitionKey);
+                    const partitionWfids = await exec.systemDatabase.findAndMarkStartableWorkflows(queue, exec.executorID, utils_1.globalParams.appVersion, partitionKey, run.descendantsOnly);
                     await dispatch(partitionWfids);
                     await (0, debugpoint_1.debugTriggerPoint)(debugpoint_1.DEBUG_TRIGGER_BETWEEN_PARTITION_DISPATCHES);
                 }
             }
             else {
-                const wfids = await exec.systemDatabase.findAndMarkStartableWorkflows(queue, exec.executorID, utils_1.globalParams.appVersion, undefined);
+                const wfids = await exec.systemDatabase.findAndMarkStartableWorkflows(queue, exec.executorID, utils_1.globalParams.appVersion, undefined, run.descendantsOnly);
                 await dispatch(wfids);
             }
         }

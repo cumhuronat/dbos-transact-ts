@@ -2262,7 +2262,7 @@ class SystemDatabase {
          AND queue_partition_key IS NOT NULL`, [queueName, workflow_1.StatusString.ENQUEUED]);
         return rows.map((row) => row.queue_partition_key);
     }
-    async findAndMarkStartableWorkflows(queue, executorID, appVersion, queuePartitionKey) {
+    async findAndMarkStartableWorkflows(queue, executorID, appVersion, queuePartitionKey, descendantsOnly = false) {
         const startTimeMs = Date.now();
         const limiterPeriodMS = queue.rateLimit ? queue.rateLimit.periodSec * 1000 : 0;
         const claimedIDs = [];
@@ -2344,12 +2344,14 @@ class SystemDatabase {
             const lockMode = queue.concurrency ? 'FOR UPDATE NOWAIT' : 'FOR UPDATE SKIP LOCKED';
             const limitClause = maxTasks !== Infinity ? `LIMIT ${maxTasks}` : '';
             const selectParams = [workflow_1.StatusString.ENQUEUED, queue.name, appVersion, ...partitionParams];
+            const parentClause = descendantsOnly ? 'AND parent_workflow_id IS NOT NULL' : '';
             const selectQuery = `
         SELECT workflow_uuid
         FROM "${this.schemaName}".workflow_status
         WHERE status = $1
           AND queue_name = $2
           AND ${versionClause}
+          ${parentClause}
           ${partitionFilter.replace('$PARTITION', '$4')}
         ORDER BY priority ASC, created_at ASC
         ${limitClause}

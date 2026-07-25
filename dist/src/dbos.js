@@ -331,6 +331,19 @@ class DBOS {
     static async deactivateEventReceivers() {
         return dbos_executor_1.DBOSExecutor.globalInstance?.deactivateEventReceivers();
     }
+    /**
+     * Stop this process's queue dispatcher from claiming new root workflows while continuing to
+     * dispatch queued child workflows from any workflow tree. Other DBOS executors are unaffected.
+     * The returned promise is a barrier: after it resolves, every local poll that could claim a root
+     * has finished. This mode is irreversible for the current launch; call shutdown and launch again
+     * to resume root dispatch. It throws if the dispatcher is not running or stops before the barrier
+     * returns. Callers must bound their own tree-drain wait before normal DBOS shutdown stops the
+     * queue dispatcher.
+     */
+    static async quiesceWorkflowQueueRoots() {
+        (0, decorators_1.ensureDBOSIsLaunched)('quiesceWorkflowQueueRoots');
+        await wfqueue_1.wfQueueRunner.quiesceRootWorkflows();
+    }
     /** Start listening for external events (for testing) */
     static async initEventReceivers() {
         return dbos_executor_1.DBOSExecutor.globalInstance?.initEventReceivers(this.#dbosConfig?.listenQueues || null);
