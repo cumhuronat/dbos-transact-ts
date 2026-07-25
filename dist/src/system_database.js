@@ -2564,7 +2564,8 @@ class SystemDatabase {
         addFilter('application_version', input.applicationVersion);
         addFilter('executor_id', input.executorId);
         const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-        const orderClause = `ORDER BY created_at ${input.sortDesc ? 'DESC' : 'ASC'}`;
+        const sortDirection = input.sortDesc ? 'DESC' : 'ASC';
+        const orderClause = `ORDER BY created_at ${sortDirection}, workflow_uuid ${sortDirection}`;
         const limitClause = input.limit ? `LIMIT ${input.limit}` : '';
         const offsetClause = input.offset ? `OFFSET ${input.offset}` : '';
         const query = `

@@ -51,6 +51,26 @@ describe('workflow-management-tests', () => {
     expect(workflows.length).toBe(1);
   });
 
+  test('getworkflows pagination has a deterministic workflow-ID tiebreaker', async () => {
+    const workflowIDs = await Promise.all(
+      Array.from({ length: 11 }, () => TestEndpoints.testWorkflowGetID()),
+    );
+    await systemDBClient.query(
+      `UPDATE dbos.workflow_status
+          SET created_at = $1
+        WHERE workflow_uuid = ANY($2::text[])`,
+      [1, workflowIDs],
+    );
+    const expected = [...workflowIDs].sort();
+
+    const first = await DBOS.listWorkflows({ limit: 6, offset: 0 });
+    const second = await DBOS.listWorkflows({ limit: 6, offset: 6 });
+    expect([...first, ...second].map((workflow) => workflow.workflowID)).toEqual(expected);
+
+    const descending = await DBOS.listWorkflows({ limit: 11, sortDesc: true });
+    expect(descending.map((workflow) => workflow.workflowID)).toEqual(expected.reverse());
+  });
+
   test('getworkflows-with-dates', async () => {
     await expect(TestEndpoints.testWorkflow('alice')).resolves.toBe('alice');
 
