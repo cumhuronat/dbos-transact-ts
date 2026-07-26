@@ -192,6 +192,7 @@ export interface GetWorkflowsInput {
   limit?: number; // Return up to this many workflows IDs. IDs are ordered by workflow creation time.
   offset?: number; // Skip this many workflows IDs. IDs are ordered by workflow creation time.
   sortDesc?: boolean; // Sort the workflows in descending order by creation time (default ascending order).
+  workflowCursor?: { createdAt: number; workflowID: string }; // Return rows strictly after this composite cursor in the configured sort order.
   loadInput?: boolean; // Load the input of the workflow (default true)
   loadOutput?: boolean; // Load the output of the workflow (default true)
 }

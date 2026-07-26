@@ -71,6 +71,38 @@ describe('workflow-management-tests', () => {
     expect(descending.map((workflow) => workflow.workflowID)).toEqual(expected.reverse());
   });
 
+  test('getworkflows keyset pagination does not skip rows that leave the filtered set', async () => {
+    const workflowIDs = await Promise.all(
+      Array.from({ length: 11 }, () => TestEndpoints.testWorkflowGetID()),
+    );
+    await systemDBClient.query(
+      `UPDATE dbos.workflow_status
+          SET created_at = $1
+        WHERE workflow_uuid = ANY($2::text[])`,
+      [1, workflowIDs],
+    );
+    const expected = [...workflowIDs].sort();
+    const first = await DBOS.listWorkflows({ status: 'SUCCESS', limit: 6 });
+    const cursor = first.at(-1);
+    if (!cursor) throw new Error('expected the first keyset page to contain a cursor row');
+
+    await systemDBClient.query(
+      `UPDATE dbos.workflow_status SET status = 'ERROR' WHERE workflow_uuid = $1`,
+      [first[0].workflowID],
+    );
+    const second = await DBOS.listWorkflows({
+      status: 'SUCCESS',
+      limit: 6,
+      workflowCursor: {
+        createdAt: cursor.createdAt,
+        workflowID: cursor.workflowID,
+      },
+    });
+
+    expect(first.map((workflow) => workflow.workflowID)).toEqual(expected.slice(0, 6));
+    expect(second.map((workflow) => workflow.workflowID)).toEqual(expected.slice(6));
+  });
+
   test('getworkflows-with-dates', async () => {
     await expect(TestEndpoints.testWorkflow('alice')).resolves.toBe('alice');
 

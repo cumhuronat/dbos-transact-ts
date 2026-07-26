@@ -3528,6 +3528,13 @@ export class SystemDatabase {
     addFilter('application_version', input.applicationVersion);
     addFilter('executor_id', input.executorId);
 
+    if (input.workflowCursor) {
+      const comparison = input.sortDesc ? '<' : '>';
+      whereClauses.push(`(created_at, workflow_uuid) ${comparison} ($${paramCounter}, $${paramCounter + 1})`);
+      params.push(input.workflowCursor.createdAt, input.workflowCursor.workflowID);
+      paramCounter += 2;
+    }
+
     const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
     const sortDirection = input.sortDesc ? 'DESC' : 'ASC';
     const orderClause = `ORDER BY created_at ${sortDirection}, workflow_uuid ${sortDirection}`;

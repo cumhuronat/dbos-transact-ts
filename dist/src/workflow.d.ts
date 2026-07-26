@@ -110,6 +110,10 @@ export interface GetWorkflowsInput {
     limit?: number;
     offset?: number;
     sortDesc?: boolean;
+    workflowCursor?: {
+        createdAt: number;
+        workflowID: string;
+    };
     loadInput?: boolean;
     loadOutput?: boolean;
 }
