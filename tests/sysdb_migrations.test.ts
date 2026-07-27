@@ -72,6 +72,32 @@ describe('sysdb migration runner', () => {
     expect(await indexExists(client, 'idx_workflow_status_queue_status_started')).toBe(false);
   });
 
+  test('uses a pre-provisioned schema without database CREATE authority', async () => {
+    const role = `dbos_schema_owner_${Date.now()}`;
+    const password = `dbos-schema-owner-${Date.now()}`;
+    await client.query(`CREATE ROLE "${role}" LOGIN PASSWORD '${password}'`);
+    await client.query(`CREATE SCHEMA "${TEST_SCHEMA}" AUTHORIZATION "${role}"`);
+    const database = await client.query<{ name: string }>('SELECT current_database() AS name');
+    await client.query(`GRANT CONNECT ON DATABASE "${database.rows[0].name}" TO "${role}"`);
+
+    const config = generateDBOSTestConfig();
+    const url = new URL(config.systemDatabaseUrl!);
+    url.username = role;
+    url.password = password;
+    const restricted = new Client({ connectionString: url.toString() });
+    await restricted.connect();
+    try {
+      const migrations = allMigrations(TEST_SCHEMA, { useListenNotify: false });
+      await expect(
+        runSysMigrationsPg(restricted, migrations, TEST_SCHEMA, { onWarn: () => {} }),
+      ).resolves.toMatchObject({ toVersion: migrations.length });
+    } finally {
+      await restricted.end();
+      await resetSchema(client);
+      await client.query(`DROP ROLE "${role}"`);
+    }
+  });
+
   test('per-version bump on partial failure resumes on retry', async () => {
     const baseSchema: ReadonlyArray<DBMigration> = [
       { pg: [`CREATE SCHEMA IF NOT EXISTS "${TEST_SCHEMA}"`] },

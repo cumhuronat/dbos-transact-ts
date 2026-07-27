@@ -8,7 +8,19 @@ function allMigrations(schemaName = 'dbos', opts) {
     return [
         {
             name: '20240123182943_schema',
-            pg: [`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`],
+            pg: [
+                `DO $dbos_schema$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_namespace
+     WHERE nspname = '${schemaName}'
+  ) THEN
+    EXECUTE 'CREATE SCHEMA "${schemaName}"';
+  END IF;
+END
+$dbos_schema$`,
+            ],
         },
         {
             name: '20240123182944_dbos_migrations',
