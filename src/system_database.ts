@@ -714,6 +714,8 @@ export class SystemDatabase {
    *     dropped, and only the PG server log may note it.  For those reasons, we do occasional polling
    */
   notificationsClient: PoolClient | null = null;
+  private notificationsErrorHandler: ((err: Error) => void) | null = null;
+  private destroying: boolean = false;
   dbPollingIntervalResultMs: number = 1000;
   dbPollingIntervalEventMs: number = 10000;
   shouldUseDBNotifications: boolean = true;
@@ -824,8 +826,10 @@ export class SystemDatabase {
   }
 
   async destroy() {
+    this.destroying = true;
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
     }
     // Stop the notifier and await its final flush before the pool closes.
     this.#notifierActive = false;
@@ -834,9 +838,17 @@ export class SystemDatabase {
       await this.#notifierLoop;
       this.#notifierLoop = undefined;
     }
-    if (this.notificationsClient) {
+    const notificationsClient = this.notificationsClient;
+    const notificationsErrorHandler = this.notificationsErrorHandler;
+    this.notificationsClient = null;
+    this.notificationsErrorHandler = null;
+    if (notificationsClient) {
       try {
-        this.notificationsClient.release(true);
+        if (notificationsErrorHandler) {
+          notificationsClient.removeListener('error', notificationsErrorHandler);
+        }
+        notificationsClient.removeAllListeners('notification');
+        notificationsClient.release(true);
       } catch (e) {
         this.logger.warn(`Error ending notifications client: ${String(e)}`);
       }
@@ -4701,14 +4713,20 @@ export class SystemDatabase {
   async #listenForNotifications() {
     const connect = async () => {
       const reconnect = () => {
-        if (this.reconnectTimeout) {
+        if (this.destroying || this.reconnectTimeout) {
           return;
         }
         this.reconnectTimeout = setTimeout(async () => {
           this.reconnectTimeout = null;
-          await connect();
+          if (!this.destroying) {
+            await connect();
+          }
         }, 1000);
       };
+
+      if (this.destroying) {
+        return;
+      }
 
       let client: PoolClient | null = null;
       try {
@@ -4765,21 +4783,40 @@ export class SystemDatabase {
           }
         };
 
-        client.on('notification', handler);
-        client.on('error', (err: Error) => {
+        if (this.destroying) {
+          client.removeAllListeners('notification');
+          client.release(true);
+          client = null;
+          return;
+        }
+
+        const errorHandler = (err: Error) => {
           this.logger.warn(`Error in notifications client: ${err}`);
-          if (client) {
-            client.removeAllListeners();
-            client.release(true);
+          if (client && this.notificationsClient === client) {
+            this.notificationsClient = null;
+            this.notificationsErrorHandler = null;
+            const failedClient = client;
+            client = null;
+            failedClient.removeAllListeners();
+            failedClient.release(true);
           }
           reconnect();
-        });
+        };
+        client.on('notification', handler);
+        client.on('error', errorHandler);
+        this.notificationsErrorHandler = errorHandler;
         this.notificationsClient = client;
       } catch (error) {
         this.logger.warn(`Error in notifications listener: ${String(error)}`);
         if (client) {
-          client.removeAllListeners();
-          client.release(true);
+          if (this.notificationsClient === client) {
+            this.notificationsClient = null;
+            this.notificationsErrorHandler = null;
+          }
+          const failedClient = client;
+          client = null;
+          failedClient.removeAllListeners();
+          failedClient.release(true);
         }
         reconnect();
       }

@@ -240,6 +240,8 @@ export declare class SystemDatabase {
     readonly pool: Pool;
     readonly schemaName: string;
     notificationsClient: PoolClient | null;
+    private notificationsErrorHandler;
+    private destroying;
     dbPollingIntervalResultMs: number;
     dbPollingIntervalEventMs: number;
     shouldUseDBNotifications: boolean;
