@@ -94,6 +94,7 @@ describe('sysdb migration runner', () => {
     } finally {
       await restricted.end();
       await resetSchema(client);
+      await client.query(`DROP OWNED BY "${role}"`);
       await client.query(`DROP ROLE "${role}"`);
     }
   });

@@ -56,13 +56,12 @@ exports.DBOS_WORKFLOW_COMPLETION_CHANNEL = 'dbos_workflow_completion';
 exports.QUEUE_WAKEUP_KEY = 'dbos_queue_wakeup';
 // Interval for coalescing LISTEN/NOTIFY notifications off the write path; caps the rate of notifying commits regardless of write throughput.
 exports.DEFAULT_NOTIFICATION_COALESCE_MS = 10;
-// Workflow statuses that are terminal — reaching one wakes a getResult() waiter on the completion channel.
-const TERMINAL_WORKFLOW_STATUSES = new Set([
-    workflow_1.StatusString.SUCCESS,
-    workflow_1.StatusString.ERROR,
-    workflow_1.StatusString.CANCELLED,
-    workflow_1.StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED,
-]);
+function isTerminalWorkflowStatus(status) {
+    return (status === workflow_1.StatusString.SUCCESS ||
+        status === workflow_1.StatusString.ERROR ||
+        status === workflow_1.StatusString.CANCELLED ||
+        status === workflow_1.StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED);
+}
 const QUEUE_COLUMN_BY_FIELD = {
     concurrency: 'concurrency',
     workerConcurrency: 'worker_concurrency',
@@ -3389,7 +3388,7 @@ class SystemDatabase {
         // This is the central status writer for SUCCESS/ERROR/MAX_RECOVERY (bulk CANCELLED wakes in
         // #cancelWorkflows), so terminal transitions are covered without a per-update trigger. The signal
         // is in-memory and coalesced; the notifier flushes it off the write path, after this txn commits.
-        if (result.rowCount === 1 && TERMINAL_WORKFLOW_STATUSES.has(status)) {
+        if (result.rowCount === 1 && isTerminalWorkflowStatus(status)) {
             this.#signalWake(exports.DBOS_WORKFLOW_COMPLETION_CHANNEL, workflowID);
         }
         const throwOnFailure = options.throwOnFailure ?? true;

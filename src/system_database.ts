@@ -100,13 +100,14 @@ export const QUEUE_WAKEUP_KEY = 'dbos_queue_wakeup';
 // Interval for coalescing LISTEN/NOTIFY notifications off the write path; caps the rate of notifying commits regardless of write throughput.
 export const DEFAULT_NOTIFICATION_COALESCE_MS = 10;
 
-// Workflow statuses that are terminal — reaching one wakes a getResult() waiter on the completion channel.
-const TERMINAL_WORKFLOW_STATUSES: ReadonlySet<string> = new Set([
-  StatusString.SUCCESS,
-  StatusString.ERROR,
-  StatusString.CANCELLED,
-  StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED,
-]);
+function isTerminalWorkflowStatus(status: string): boolean {
+  return (
+    status === StatusString.SUCCESS ||
+    status === StatusString.ERROR ||
+    status === StatusString.CANCELLED ||
+    status === StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED
+  );
+}
 
 export interface WorkflowScheduleInternal {
   scheduleId: string;
@@ -4537,7 +4538,7 @@ export class SystemDatabase {
     // This is the central status writer for SUCCESS/ERROR/MAX_RECOVERY (bulk CANCELLED wakes in
     // #cancelWorkflows), so terminal transitions are covered without a per-update trigger. The signal
     // is in-memory and coalesced; the notifier flushes it off the write path, after this txn commits.
-    if (result.rowCount === 1 && TERMINAL_WORKFLOW_STATUSES.has(status)) {
+    if (result.rowCount === 1 && isTerminalWorkflowStatus(status)) {
       this.#signalWake(DBOS_WORKFLOW_COMPLETION_CHANNEL, workflowID);
     }
 
