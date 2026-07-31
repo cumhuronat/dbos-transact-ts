@@ -711,6 +711,15 @@ $dbos_schema$`,
                 ]
                 : [],
         },
+        // MAX_RECOVERY_ATTEMPTS_EXCEEDED is terminal but intentionally has no
+        // completed_at value. Retention consumers therefore use updated_at as the
+        // terminal-age clock and need bounded keyset selection over that class.
+        {
+            online: true,
+            pg: [
+                `CREATE INDEX ${c} IF NOT EXISTS "idx_workflow_status_recovery_exhausted_updated_at" ON "${schemaName}"."workflow_status" ("updated_at", "workflow_uuid") WHERE "status" = 'MAX_RECOVERY_ATTEMPTS_EXCEEDED' AND "completed_at" IS NULL`,
+            ],
+        },
     ];
 }
 exports.allMigrations = allMigrations;

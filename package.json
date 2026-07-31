@@ -1,6 +1,6 @@
 {
   "name": "@dbos-inc/dbos-sdk",
-  "version": "4.24.16-wake.7",
+  "version": "4.24.16-wake.8",
   "description": "A Typescript framework built on the database",
   "license": "MIT",
   "repository": {
